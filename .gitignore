@@ -1,0 +1,28 @@
+# Ignore image files
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+
+# Ignore text files
+*.txt
+
+# Ignore binary files
+*.bin
+
+# Ignore model files
+*.pth
+*.pt
+*.ckpt
+
+# Ignore cache directories
+__pycache__/
+.cache/
+
+# Ignore log files
+*.log
+
+# Ignore OS generated files
+.DS_Store
+Thumbs.db
