@@ -1,0 +1,15 @@
+artifact_uri: file:///root/autodl-tmp/vision_llm/mlruns/0/1a29b672e42a4ee9b38a088f0a29bba0/artifacts
+end_time: 1728368162688
+entry_point_name: ''
+experiment_id: '0'
+lifecycle_stage: active
+run_id: 1a29b672e42a4ee9b38a088f0a29bba0
+run_name: wise-chimp-521
+run_uuid: 1a29b672e42a4ee9b38a088f0a29bba0
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1728219397851
+status: 3
+tags: []
+user_id: root

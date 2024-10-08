@@ -12,8 +12,6 @@ import mlflow
 from einops import rearrange
 import matplotlib.pyplot as plt
 import os
-import pyiqa
-from scipy import linalg
 from torch.nn import functional as F
 from training import utils
 def train_one_epoch(
@@ -74,16 +72,17 @@ def train_one_epoch(
                                     list(model.module.codebook_projection.parameters()) + 
                                     list(model.module.post_quant_conv.parameters()), update_grad=(data_iter_step + 1) % accum_iter == 0)
         else:
-            loss_scaler_ae(loss, opt_ae, parameters=list(model.module.encoder.parameters())+
-                                    list(model.module.decoder.parameters())+
-                                    list(model.module.quant_conv.parameters())+
-                                    list(model.module.tok_embeddings.parameters())+
-                                    list(model.module.post_quant_conv.parameters()), update_grad=(data_iter_step + 1) % accum_iter == 0)
+            loss_scaler_ae(loss, opt_ae, parameters=list(model.encoder.parameters())+
+                                        list(model.decoder.parameters())+
+                                        list(model.quant_conv.parameters())+
+                                        list(model.tok_embeddings.parameters())+
+                                        list(model.post_quant_conv.parameters()), 
+                                        update_grad=(data_iter_step + 1) % accum_iter == 0)
         if cur_iter > args.disc_start and args.rate_d != 0:
             d_loss, _, _, _, _, _, _ = model(x, cur_iter, step=1)
             opt_disc.zero_grad()
             lr_sched.adjust_learning_rate(opt_disc, data_iter_step / len(data_loader) + epoch, args)
-            loss_scaler_disc(d_loss, opt_disc, parameters=model.module.discriminator.parameters(), update_grad=(data_iter_step + 1) % accum_iter == 0)
+            loss_scaler_disc(d_loss, opt_disc, parameters=model.discriminator.parameters(), update_grad=(data_iter_step + 1) % accum_iter == 0)
 
         torch.cuda.synchronize()
         

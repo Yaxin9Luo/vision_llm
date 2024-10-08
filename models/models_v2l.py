@@ -5,9 +5,9 @@ import importlib
 from einops import rearrange
 from torch.nn import Embedding
 from models.discriminator import NLayerDiscriminator, weights_init
-import models.global_encoder as clip
 from models.lpips import LPIPS
 from models.encoder_decoder import Encoder, Decoder
+from transformers import GPT2Model, GPT2Config
 
     
 def get_obj_from_str(string, reload=False):
@@ -50,6 +50,8 @@ class VQModel_LLaMA(pl.LightningModule):
         self.decoder = Decoder(**ddconfig)
         self.quant_conv = torch.nn.Conv2d(ddconfig["z_channels"], embed_dim, 1)
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
+        self.gpt2_config = GPT2Config.from_pretrained('gpt2-medium')
+        self.gpt2 = GPT2Model.from_pretrained('gpt2-medium', config=self.gpt2_config)
 
 
         ####Codebook
@@ -141,7 +143,35 @@ class VQModel_LLaMA(pl.LightningModule):
                 z_q.shape[0], z_q.shape[2], z_q.shape[3])
 
         return z_q, loss, (d, min_encodings, min_encoding_indices)
-    
+    def random_masking(self, x, mask_ratio):
+        N, C, H, W = x.shape
+        L = H * W
+        len_keep = int(L * (1 - mask_ratio))
+        
+        noise = torch.rand(N, L, device=x.device)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        ids_keep = ids_shuffle[:, :len_keep]
+        ids_remove = ids_shuffle[:, len_keep:]
+
+        # Flatten spatial dimensions
+        x_flattened = x.flatten(2)
+
+        # Create a mask for kept indices
+        mask = torch.zeros(N, L, device=x.device)
+        mask.scatter_(1, ids_keep, 1)
+
+        # Apply masking
+        x_masked = x_flattened * mask.unsqueeze(1)
+
+        # Reshape back to original shape
+        x_masked = x_masked.view(N, C, H, W)
+
+        # Create binary mask (1 is remove, 0 is keep)
+        mask = 1 - mask
+
+        return x_masked, mask, ids_restore
     def forward(self, input, data_iter_step, step=0, is_val=False, k=21):
                    
         encoder_feature = self.quant_conv(self.encoder(input))
@@ -150,9 +180,22 @@ class VQModel_LLaMA(pl.LightningModule):
 
         if self.stage == 2: ## if only needs quantized feature(eg. finetuning LLM) 
             return quant,tk_labels.view(input.shape[0], -1)
+        # print(f"check shape of quant: {quant.shape}") # torch.Size([16, 768, 16, 16])
+        # Apply random masking
+        quant_masked, mask, ids_restore = self.random_masking(quant, mask_ratio=0.75)
+        # Reshape quant for GPT-2 input
+        N, C, H, W = quant_masked.shape
+        quant_seq = quant_masked.permute(0, 2, 3, 1).reshape(N, H*W, C)
+        # Pass through GPT-2
+        
+        gpt2_output = self.gpt2(inputs_embeds=quant_seq).last_hidden_state
 
+        # Reshape GPT-2 output back to image shape
+        quant_pred = gpt2_output.reshape(N, H, W, C).permute(0, 3, 1, 2)
+        # Combine masked and predicted tokens
+        quant = quant * (1 - mask.view(N, 1, H, W)) + quant_pred * mask.view(N, 1, H, W)
         dec = self.decode(quant)
-
+        # print(f"check shape of dec: {dec.shape}") # torch.Size([16, 3, 128, 128])
         ###Loss
         rec_loss = torch.mean(torch.abs(input.contiguous() - dec.contiguous()))
         

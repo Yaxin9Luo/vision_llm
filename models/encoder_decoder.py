@@ -338,7 +338,7 @@ class Decoder(nn.Module):
                                        temb_channels=self.temb_ch,
                                        dropout=dropout)
         self.mid.attn_1 = AttnBlock(block_in)
-        self.mid.cross_attn_1 = CrossAttention(block_in, context_dim=768, heads=8, dim_head=block_in, dropout=0.0)
+        self.mid.cross_attn_1 = CrossAttention(block_in, context_dim=1024, heads=8, dim_head=block_in, dropout=0.0)
         self.mid.block_2 = ResnetBlock(in_channels=block_in,
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
