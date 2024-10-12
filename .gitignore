@@ -19,7 +19,8 @@
 # Ignore cache directories
 __pycache__/
 .cache/
-
+.output_dir/
+.mlruns/
 # Ignore log files
 *.log
 
