@@ -43,7 +43,7 @@ def preprocess_vqgan(x):
 
 
 class ImageNetDataset(Dataset):
-    def __init__(self, data_root, image_size, max_words=30, n_class=1000, partition="train", device="cpu", use_subset=0.01):
+    def __init__(self, data_root, image_size, max_words=30, n_class=1000, partition="train", device="cpu", use_subset=0.05):
         self.max_words = max_words
         self.device = device
         self.image_size = image_size
@@ -65,7 +65,6 @@ class ImageNetDataset(Dataset):
         self.image_ids = []
         self.class_labels = []
 
-        # 直接从数据目录读取图像文件
         partition_dir = os.path.join(self.data_root, partition)
         class_dirs = [d for d in os.listdir(partition_dir) if os.path.isdir(os.path.join(partition_dir, d))]
         
@@ -74,8 +73,6 @@ class ImageNetDataset(Dataset):
                 break
             class_path = os.path.join(partition_dir, class_dir)
             image_files = [f for f in os.listdir(class_path) if f.endswith(('.JPEG', '.jpg', '.png'))]
-            
-            # 随机选择一部分图像
             subset_size = max(1, int(len(image_files) * use_subset))
             selected_images = np.random.choice(image_files, subset_size, replace=False)
             
@@ -106,7 +103,7 @@ def get_args_parser():
     parser = argparse.ArgumentParser("MAE pre-training", add_help=False)
     parser.add_argument(
         "--batch_size",
-        default=4,
+        default=8,
         type=int,
         help="Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus",
     )
@@ -139,8 +136,8 @@ def get_args_parser():
     parser.add_argument("--warmup_epochs", type=int, default=5, metavar="N", help="epochs to warmup LR")
 
     # Dataset parameters
-    parser.add_argument("--output_dir", default="./output_dir", help="path where to save, empty for no saving")
-    parser.add_argument("--log_dir", default="./output_dir", help="path where to tensorboard log")
+    parser.add_argument("--output_dir", default="./output_dir/frozen_llm_codebook", help="path where to save, empty for no saving")
+    parser.add_argument("--log_dir", default="./output_dir/frozen_llm_codebook", help="path where to tensorboard log")
     parser.add_argument("--device", default="cuda", help="device to use for training / testing")
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--resume", default="", help="resume from checkpoint")
@@ -202,7 +199,6 @@ def main(args):
     np.random.seed(seed)
 
     cudnn.benchmark = True
-    # 确保分布式环境已经初始化
     if args.distributed:
         rank = dist.get_rank()
         print(f"Start running basic DDP example on rank {rank}.")
@@ -213,10 +209,10 @@ def main(args):
         rank = 0
         device_id = 0
     dataset_train = ImageNetDataset(
-        data_root=args.imagenet_path, image_size=args.image_size, max_words=args.max_seq_len, n_class=args.n_class, partition="train", device=device,use_subset=0.01
+        data_root=args.imagenet_path, image_size=args.image_size, max_words=args.max_seq_len, n_class=args.n_class, partition="train", device=device,use_subset=0.02
     )
     dataset_val = ImageNetDataset(
-        data_root=args.imagenet_path, image_size=args.image_size, max_words=args.max_seq_len, n_class=args.n_class, partition="val", device=device,use_subset=0.01
+        data_root=args.imagenet_path, image_size=args.image_size, max_words=args.max_seq_len, n_class=args.n_class, partition="val", device=device,use_subset=0.02
     )
 
     if True:  # args.distributed:
@@ -270,25 +266,21 @@ def main(args):
     print("actual lr: %.2e" % args.lr)
     print("accumulate grad iterations: %d" % args.accum_iter)
     print("effective batch size: %d" % eff_batch_size)
-
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device_id], find_unused_parameters=True)
         model_without_ddp = model.module
-
-    #####Using Projector
-    if args.use_cblinear == 1:
-        opt_ae = torch.optim.Adam(list(model_without_ddp.encoder.parameters())+
-                                list(model_without_ddp.decoder.parameters())+
-                                list(model_without_ddp.tok_embeddings.parameters())+
-                                list(model_without_ddp.quant_conv.parameters())+
-                                list(model_without_ddp.codebook_projection.parameters()) + 
-                                list(model_without_ddp.post_quant_conv.parameters()), lr=args.lr, betas=(0.5, 0.9), eps=1e-7)
     else:
-        opt_ae = torch.optim.Adam(list(model_without_ddp.encoder.parameters())+
-                                list(model_without_ddp.decoder.parameters())+
-                                list(model_without_ddp.tok_embeddings.parameters())+
-                                list(model_without_ddp.quant_conv.parameters())+
-                                list(model_without_ddp.post_quant_conv.parameters()), lr=args.lr, betas=(0.5, 0.9), eps=1e-7)
+        model_without_ddp = model
+
+    opt_ae = torch.optim.Adam(list(model_without_ddp.encoder.parameters())+
+                            list(model_without_ddp.decoder.parameters())+
+                            list(model_without_ddp.quant_conv.parameters())+
+                            list(model_without_ddp.post_quant_conv.parameters()), lr=args.lr, betas=(0.5, 0.9), eps=1e-7)
     opt_dist = torch.optim.Adam(model_without_ddp.discriminator.parameters(), lr=args.lr, betas=(0.5, 0.9), eps=1e-7)
 
     loss_scaler_ae = NativeScaler()
