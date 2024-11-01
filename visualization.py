@@ -1,28 +1,21 @@
-import sys
-import os
-import requests
-
 import torch
-import numpy as np
-import matplotlib.pyplot as plt
 from PIL import Image
-from models.models_v2l import VQModel_LLaMA 
-import yaml
-import torch
-import clip
+import matplotlib.pyplot as plt
+from torchvision import transforms
+from models.models_v2l import VQModel_RoBERTa
+from transformers import RobertaTokenizer
 from omegaconf import OmegaConf
+import yaml
 import argparse
-from transformers import GPT2Tokenizer
-import matplotlib.pyplot as plt
+import numpy as np
+from collections import Counter
 import seaborn as sns
-import torch.nn.functional as F
-from transformers import GPT2LMHeadModel, GPT2Config,GPT2Model
-from PIL import Image
+
 def get_args_parser():
     parser = argparse.ArgumentParser("MAE pre-training", add_help=False)
     parser.add_argument(
         "--batch_size",
-        default=4,
+        default=1,
         type=int,
         help="Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus",
     )
@@ -33,7 +26,7 @@ def get_args_parser():
         type=int,
         help="Accumulate gradient iterations (for increasing the effective batch size under memory constraints)",
     )
-
+    parser.add_argument("--stage", type=int, default=1, help="Pretraining stage")
     # Model parameters
     parser.add_argument("--max_seq_len", type=int, default=512, metavar="LENGTH", help="the maximum sequence length")
 
@@ -55,8 +48,8 @@ def get_args_parser():
     parser.add_argument("--warmup_epochs", type=int, default=5, metavar="N", help="epochs to warmup LR")
 
     # Dataset parameters
-    parser.add_argument("--output_dir", default="./output_dir", help="path where to save, empty for no saving")
-    parser.add_argument("--log_dir", default="./output_dir", help="path where to tensorboard log")
+    parser.add_argument("--output_dir", default="./output_dir/frozen_roberta_codebook", help="path where to save, empty for no saving")
+    parser.add_argument("--log_dir", default="./output_dir/frozen_roberta_codebook", help="path where to tensorboard log")
     parser.add_argument("--device", default="cuda", help="device to use for training / testing")
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--resume", default="", help="resume from checkpoint")
@@ -87,7 +80,6 @@ def get_args_parser():
     parser.add_argument("--n_class", default=1000, type=int)    
     parser.add_argument("--vq_config_path", type=str, default="vqgan_configs/v2l.yaml", help="Decoding Loss")
     parser.add_argument("--image_size", type=int, default=256, help="Decoding Loss")
-    parser.add_argument("--stage", type=int, default=1, help="Decoding Loss")
     parser.add_argument("--quantizer_type", type=str, default="org", help="Decoding Loss")
 
     parser.add_argument("--embed_dim", type=int, default=1024, help="Decoding Loss")
@@ -101,124 +93,201 @@ def get_args_parser():
 
 
     return parser
-imagenet_mean = np.array([0.485, 0.456, 0.406])
-imagenet_std = np.array([0.229, 0.224, 0.225])
 def load_config(config_path, display=False):
-  config = OmegaConf.load(config_path)
-  if display:
-    print(yaml.dump(OmegaConf.to_container(config)))
-  return config
-def visualize_embeddings_similarity(model, image, top_k=10):
-    # 获取VQGAN的codebook embeddings
+    config = OmegaConf.load(config_path)
+    if display:
+        print(yaml.dump(OmegaConf.to_container(config)))
+    return config
+def load_model(checkpoint_path, config_path, device, args):
+    config = load_config(config_path)
+    print("Loaded config:")
+    print(config)
+
+    print("Initializing VQModel_RoBERTa...")
+    model = VQModel_RoBERTa(args=args, **config.model.params)
+    print("Model structure:")
+    print(model)
+    
+    print(f"Loading model from {checkpoint_path}")
+    state_dict = torch.load(checkpoint_path, map_location=device)
+    print("Keys in loaded state dict:")
+    print(state_dict.keys())
+    
+    if 'model' in state_dict:
+        state_dict = state_dict['model']
+        print("Found 'model' key, using its content")
+        print("Keys in model state dict:")
+        print(state_dict.keys())
+    
+    print("Keys in current model state dict:")
+    print(model.state_dict().keys())
+    
+    print("Attempting to load state dict...")
+    try:
+        model.load_state_dict(state_dict, strict=False)
+        print("State dict loaded successfully with strict=False")
+    except Exception as e:
+        print(f"Error loading state dict: {e}")
+    
+    model = model.to(device)
+    model.eval()
+    return model
+
+def preprocess_image(image_path, device, target_size=(256, 256)):
+    transform = transforms.Compose([
+        transforms.Resize(target_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    ])
+    image = Image.open(image_path).convert('RGB')
+    return transform(image).unsqueeze(0).to(device)
+
+def visualize_quantized_tokens(model, image_tensor, tokenizer,top_n_to_remove=5):
     with torch.no_grad():
-        encoder_feature = model.quant_conv(model.encoder(image))
-        quant, _, [_, _, tk_labels] = model.encode(encoder_feature)
-        
-        # Apply random masking
-        quant_masked, mask, ids_restore = model.random_masking(quant, mask_ratio=0.75)
-        
-        # Reshape quant for GPT-2 input
-        N, C, H, W = quant_masked.shape
-        quant_seq = quant_masked.permute(0, 2, 3, 1).reshape(N, H*W, C)
-        
-        # Pass through GPT-2
-        gpt2_output = model.gpt2(inputs_embeds=quant_seq).last_hidden_state
-        quant_pred = gpt2_output.reshape(N, H, W, C).permute(0, 3, 1, 2)
-        quant = quant * (1 - mask.view(N, 1, H, W)) + quant_pred * mask.view(N, 1, H, W)
-        dec = model.decode(quant)
-        print(dec.shape)
-        dec_img = dec.squeeze(0).permute(1, 2, 0).cpu().detach().numpy()
-        dec_img = (dec_img * imagenet_std + imagenet_mean) * 255
-        dec_img = np.clip(dec_img, 0, 255).astype(np.uint8)
-        dec_pil = Image.fromarray(dec_img)
-        dec_pil.save('decoded_image.png')
-        print("Decoded image saved as 'decoded_image.png'")
-        exit()
-    # # # 获取GPT-2 tokenizer
-    # # gpt2_medium_path = "/root/.cache/huggingface/hub/models--gpt2-medium/snapshots/6dcaa7a952f72f9298047fd5137cd6e4f05f41da"
-    # # tokenizer = GPT2Tokenizer.from_pretrained(gpt2_medium_path)
-    # GPT2Model = GPT2LMHeadModel.from_pretrained('gpt2-medium')
-    # GPT2Model.to(gpt2_output.device)
-    # print(gpt2_output.shape)
-    # logits = GPT2Model.lm_head(gpt2_output)
-    # print(logits.shape)
-    # predicted_token_ids = torch.argmax(logits, dim=-1)
-    # print(predicted_token_ids[0,:128])
-    # # Save predicted token IDs to a file
-    # output_file = 'predicted_token_ids.txt'
-    # with open(output_file, 'w') as f:
-    #     for batch in predicted_token_ids:
-    #         f.write(' '.join(map(str, batch.cpu().numpy())) + '\n')
+        encoder_feature = model.quant_conv(model.encoder(image_tensor))
+        quant, tk_labels, _ = model.quantize(encoder_feature)
+    tk_labels = tk_labels.squeeze().cpu().numpy()
+    vocab = tokenizer.get_vocab()
+    id2word = {v: k for k, v in vocab.items()}
     
-    # print(f"Predicted token IDs saved to {output_file}")
-    # exit()
-    plt.figure(figsize=(15, 10))
-    sns.heatmap(logits[0, :, :100].detach().cpu().numpy(), cmap='YlOrRd')
-    plt.title('GPT-2 Output Logits (first 100 tokens)')
-    plt.xlabel('Token ID')
-    plt.ylabel('Sequence Position')
-    plt.savefig('gpt2_output_logits.png')
+    # 检查 tk_labels 的维度
+    if tk_labels.ndim == 1:
+        # 如果是一维数组，将其重塑为二维数组
+        side_length = int(tk_labels.shape[0] ** 0.5)
+        tk_labels = tk_labels.reshape(side_length, side_length)
+    
+    words = [[id2word[int(label)] for label in row] for row in tk_labels]
+    # 创建一个包含两个子图的图像
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(40, 20))
+    
+    # 左侧：tokens可视化
+    im = ax1.imshow(tk_labels, cmap='tab20')
+    # 每隔step个patch标注一次
+    step=3
+    for i in range(0, len(words), step):
+        for j in range(0, len(words[i]), step):
+            color_val = tk_labels[i, j]
+            text_color = 'white' if color_val > np.mean(tk_labels) else 'black'
+            ax1.text(j, i, words[i][j], 
+                    ha='center', va='center',
+                    color=text_color,
+                    fontsize=14,
+                    weight='bold',
+                    rotation=45)
+    
+    ax1.set_title("Quantized Tokens Visualization (8x8 patches)")
+    ax1.grid(True)
+    
+    # 右侧：原图
+    # 将tensor转换回图像格式
+    img = image_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+    # 反归一化
+    img = img * 0.5 + 0.5
+    img = np.clip(img, 0, 1)
+    ax2.imshow(img)
+    ax2.set_title("Original Image (128x128)")
+    ax2.axis('off')
+    
+    plt.tight_layout()
+    plt.savefig('tokens_and_image_visualization.png', dpi=300, bbox_inches='tight')
     plt.close()
-def main(args):
-    img_path = '/root/autodl-tmp/vision_llm/mlruns/0/1a29b672e42a4ee9b38a088f0a29bba0/artifacts/recons_79_2.png'
-    img = Image.open(img_path)
-    img = img.resize((256, 256))
-    img = np.array(img) / 255.
 
+    return words, tokenizer.convert_tokens_to_string([word for row in words for word in row])
+    # # 创建一个单词到数字的映射
+    # unique_words = sorted(set(word for row in words for word in row))
+    # word2num = {word: i for i, word in enumerate(unique_words)}
+    # # 计算词频并移除最高频的词
+    # # word_counts = Counter(word for row in words for word in row)
+    # # most_common = [word for word, _ in word_counts.most_common(top_n_to_remove)]
+    
+    # # filtered_words = [[word for word in row if word not in most_common] for row in words]
+    # # flattened_words = [word for row in filtered_words for word in row if word]
+    # flattened_words = [word for row in words for word in row]
+    # # 将单词列表连接成一个句子
+    # sentence = tokenizer.convert_tokens_to_string(flattened_words)
+    # # 将单词转换为数字
+    # num_array = np.array([[word2num[word] for word in row] for row in words])
+    
+    # plt.figure(figsize=(20, 20))
+    # im = plt.imshow(num_array, cmap='tab20')
+    # plt.colorbar(im, label='Word Index')
+    # plt.title("Quantized Tokens Visualization")
+    # plt.axis('off')
+    # plt.tight_layout()
+    # plt.savefig('quantized_tokens_visualization.png')
+    # plt.close()
 
-    assert img.shape == (256, 256, 3)
+    # return words, sentence
 
-    # normalize by ImageNet mean and std
-    img = img - imagenet_mean
-    img = img / imagenet_std
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def visualize_attention_scores(model, image_tensor, tokenizer, save_path='attention_visualization.png'):
+    """
+    Visualize attention scores from each layer of the LLM (RoBERTa) model
+    """
+    model.eval()
+    with torch.no_grad():
+        # Get image tokens
+        encoder_feature = model.quant_conv(model.encoder(image_tensor))
+        quant, tk_labels, _ = model.quantize(encoder_feature)
+        
+        # Reshape tk_labels to [batch_size, sequence_length]
+        batch_size = 1
+        tk_labels = tk_labels.view(batch_size, -1)
+        
+        # Forward pass with output_attentions=True
+        outputs = model.llm(
+            input_ids=tk_labels,
+            output_attentions=True,
+            return_dict=True
+        )
+        
+        # Get attention scores from all layers
+        attention_scores = outputs.attentions  # Tuple of tensors, one per layer
+        
+        # Create visualization
+        n_layers = len(attention_scores)
+        fig, axes = plt.subplots(4, 3, figsize=(20, 25))  # Adjust grid size based on number of layers
+        axes = axes.flatten()
+        
+        for idx, attn in enumerate(attention_scores):
+            if idx >= len(axes):
+                break
+                
+            # Take the first head of the first batch for visualization
+            attention_map = attn[0, 0].cpu().numpy()
+            
+            # Create heatmap
+            sns.heatmap(attention_map, ax=axes[idx], cmap='viridis')
+            axes[idx].set_title(f'Layer {idx+1} Attention')
+            axes[idx].set_xlabel('Key tokens')
+            axes[idx].set_ylabel('Query tokens')
+        
+        # Remove empty subplots if any
+        for idx in range(len(attention_scores), len(axes)):
+            fig.delaxes(axes[idx])
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+def main():
+    parser = get_args_parser()
+    args = parser.parse_args()
+    checkpoint_path = '/root/autodl-tmp/vision_llm/output_dir/frozen_roberta_codebook/vqgan_checkpoint-last.pth'
+    config_path = '/root/autodl-tmp/vision_llm/vqgan_configs/v2l.yaml'
+    image_path = '/root/autodl-tmp/ImageNet/train/n01614925/n01614925_47.JPEG'
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    model = load_model(checkpoint_path, config_path, device, args)
+    image_tensor = preprocess_image(image_path, device)
+    
+    tokenizer = RobertaTokenizer.from_pretrained('/root/autodl-tmp/roberta-large')
+    visualize_attention_scores(model, image_tensor, tokenizer)
+    print("Attention visualization saved as 'attention_visualization.png'")
+    # words,sentence = visualize_quantized_tokens(model, image_tensor, tokenizer)
+    
+    # print("Visualization saved as 'quantized_tokens_visualization.png'")
+    # print("Quantized tokens as a sentence:")
+    # print(sentence)
 
-    plt.rcParams['figure.figsize'] = [5, 5]
-    vqgan_chkpt_dir = '/root/autodl-tmp/mae/results/mae_vqgan_llm-decoder/checkpoint-20.pth'
-    config = load_config("/root/autodl-tmp/vision_llm/vqgan_configs/v2l.yaml", display=True)
-    model_vqgan = VQModel_LLaMA(args=args, **config.model.params)
-    checkpoint = torch.load(vqgan_chkpt_dir, map_location='cpu')
-    # Check the keys in the checkpoint
-    print("Keys in checkpoint:")
-    for key in checkpoint.keys():
-        print(f"  {key}")
-    
-    # Get the model state dict
-    state_dict = checkpoint['model']
-    
-    # Create a new state dict with matching keys
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        if k.startswith('module.'):
-            k = k[7:]  # remove 'module.' prefix
-        if k.startswith('encoder.'):
-            new_state_dict[k] = v
-        elif k.startswith('decoder.'):
-            new_state_dict[k] = v
-        elif k.startswith('quant_conv.'):
-            new_state_dict[k] = v
-        elif k.startswith('post_quant_conv.'):
-            new_state_dict[k] = v
-        elif k.startswith('tok_embeddings.'):
-            new_state_dict[k] = v
-        elif k.startswith('gpt2.'):
-            new_state_dict[k] = v
-        else:
-            print(f"Unmatched key: {k}")
-    
-    # Load the state dict
-    msg = model_vqgan.load_state_dict(new_state_dict, strict=False)
-    # print("Load state dict message:", msg)
-    
-    model_vqgan = model_vqgan.to(device)
-    model_vqgan.eval()
-    
-    img_tensor = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).float().to(device)
-    visualize_embeddings_similarity(model_vqgan, img_tensor)
-    
-
-if __name__ == '__main__':
-    args = get_args_parser()
-    args = args.parse_args()
-    main(args)
-
+if __name__ == "__main__":
+    main()

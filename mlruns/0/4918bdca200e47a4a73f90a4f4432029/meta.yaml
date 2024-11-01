@@ -1,5 +1,5 @@
 artifact_uri: file:///root/autodl-tmp/vision_llm/mlruns/0/4918bdca200e47a4a73f90a4f4432029/artifacts
-end_time: null
+end_time: 1729325180153
 entry_point_name: ''
 experiment_id: '0'
 lifecycle_stage: active
@@ -10,6 +10,6 @@ source_name: ''
 source_type: 4
 source_version: ''
 start_time: 1728564640250
-status: 1
+status: 3
 tags: []
 user_id: root

@@ -16,7 +16,7 @@ import torch
 import clip
 from omegaconf import OmegaConf
 import torch.distributed as dist
-from models.models_v2l import VQModel_LLaMA 
+from models.models_v2l import VQModel_LLaMA,VQModel_RoBERTa
 from training.engine_training import train_one_epoch
 import util.misc as misc
 import socket
@@ -114,7 +114,7 @@ def get_args_parser():
         type=int,
         help="Accumulate gradient iterations (for increasing the effective batch size under memory constraints)",
     )
-
+    parser.add_argument("--stage", type=int, default=1, help="Pretraining stage")
     # Model parameters
     parser.add_argument("--max_seq_len", type=int, default=512, metavar="LENGTH", help="the maximum sequence length")
 
@@ -136,8 +136,8 @@ def get_args_parser():
     parser.add_argument("--warmup_epochs", type=int, default=5, metavar="N", help="epochs to warmup LR")
 
     # Dataset parameters
-    parser.add_argument("--output_dir", default="./output_dir/frozen_llm_codebook", help="path where to save, empty for no saving")
-    parser.add_argument("--log_dir", default="./output_dir/frozen_llm_codebook", help="path where to tensorboard log")
+    parser.add_argument("--output_dir", default="./output_dir/vqvae_gpt2_next_token_prediction", help="path where to save, empty for no saving")
+    parser.add_argument("--log_dir", default="./output_dir/vqvae_gpt2_next_token_prediction", help="path where to tensorboard log")
     parser.add_argument("--device", default="cuda", help="device to use for training / testing")
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--resume", default="", help="resume from checkpoint")
@@ -168,7 +168,6 @@ def get_args_parser():
     parser.add_argument("--n_class", default=1000, type=int)    
     parser.add_argument("--vq_config_path", type=str, default="vqgan_configs/v2l.yaml", help="Decoding Loss")
     parser.add_argument("--image_size", type=int, default=256, help="Decoding Loss")
-    parser.add_argument("--stage", type=int, default=1, help="Decoding Loss")
     parser.add_argument("--quantizer_type", type=str, default="org", help="Decoding Loss")
 
     parser.add_argument("--embed_dim", type=int, default=1024, help="Decoding Loss")
@@ -281,26 +280,22 @@ def main(args):
                             list(model_without_ddp.decoder.parameters())+
                             list(model_without_ddp.quant_conv.parameters())+
                             list(model_without_ddp.post_quant_conv.parameters()), lr=args.lr, betas=(0.5, 0.9), eps=1e-7)
-    opt_dist = torch.optim.Adam(model_without_ddp.discriminator.parameters(), lr=args.lr, betas=(0.5, 0.9), eps=1e-7)
 
     loss_scaler_ae = NativeScaler()
-    loss_scaler_disc = NativeScaler()
 
     ##auto resume
     if os.path.exists(os.path.join(args.output_dir, 'vqgan_checkpoint-last.pth')):
         ckpt = torch.load(os.path.join(args.output_dir, 'vqgan_checkpoint-last.pth'), map_location="cpu")
         model_without_ddp.load_state_dict(ckpt["model"], strict=True)
         opt_ae.load_state_dict(ckpt["opt_ae"])
-        opt_dist.load_state_dict(ckpt["opt_dist"])
         loss_scaler_ae.load_state_dict(ckpt["scaler_ae"])
-        loss_scaler_disc.load_state_dict(ckpt["scaler_dist"])
         args = ckpt["args"]
         args.start_epoch = ckpt["epoch"] + 1
         print(args)
         print("*********Resuming From Epoch %d********"%(args.start_epoch))
 
-    optimizer = [opt_ae, opt_dist]
-    loss_scaler = [loss_scaler_ae, loss_scaler_disc]
+    optimizer = opt_ae
+    loss_scaler = loss_scaler_ae
 
     num_val_images = len(dataset_val.image_ids)
 
@@ -316,7 +311,7 @@ def main(args):
             model, data_loader_train, optimizer, device, epoch, loss_scaler, log_writer=log_writer, args=args
         )
 
-        misc.save_model_last_vqgan_ganloss(
+        misc.save_model_last_vqgan(
                 args=args,
                 model=model,
                 model_without_ddp=model_without_ddp,
