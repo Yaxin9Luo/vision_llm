@@ -361,32 +361,30 @@ def all_reduce_mean(x):
         return x
 
 
-
-
-
-def save_model_vqgan(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
+def save_model_vqvae(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
     output_dir = Path(args.output_dir)
     epoch_name = str(epoch)
     if loss_scaler is not None:
-        checkpoint_paths = [output_dir / ('vqgan_checkpoint-%s.pth' % epoch_name)]
+        checkpoint_paths = [output_dir / ('vqvae_checkpoint-%s.pth' % epoch_name)]
         for checkpoint_path in checkpoint_paths:
             to_save = {
                 'state_dict': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
                 'epoch': epoch,
+                'scaler': loss_scaler.state_dict(),
                 'args': args,
             }
-
             save_on_master(to_save, checkpoint_path)
     else:
         client_state = {'epoch': epoch}
         model.save_checkpoint(save_dir=args.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)
 
 
-def save_model_last_vqgan(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
+def save_model_last_vqvae(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
     output_dir = Path(args.output_dir)
     epoch_name = str(epoch)
     if loss_scaler is not None:
-        checkpoint_paths = [output_dir / ('vqgan_checkpoint-last.pth')]
+        checkpoint_paths = [output_dir / ('vqvae_checkpoint-last.pth')]
         for checkpoint_path in checkpoint_paths:
             to_save = {
                 'model': model_without_ddp.state_dict(),
@@ -395,37 +393,11 @@ def save_model_last_vqgan(args, epoch, model, model_without_ddp, optimizer, loss
                 'scaler': loss_scaler.state_dict(),
                 'args': args,
             }
-
             save_on_master(to_save, checkpoint_path)
     else:
         client_state = {'epoch': epoch}
         model.save_checkpoint(save_dir=args.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)
 
-
-
-
-def save_model_last_vqgan_ganloss(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
-    output_dir = Path(args.output_dir)
-    epoch_name = str(epoch)
-    if loss_scaler is not None:
-        checkpoint_paths = [output_dir / ('vqgan_checkpoint-last.pth')]
-        for checkpoint_path in checkpoint_paths:
-            opt_ae, opt_dist = optimizer
-            loss_scaler_ae, loss_scaler_dist = loss_scaler
-            to_save = {
-                'model': model_without_ddp.state_dict(),
-                'opt_ae': opt_ae.state_dict(),
-                'opt_dist': opt_dist.state_dict(),
-                'epoch': epoch,
-                'scaler_ae': loss_scaler_ae.state_dict(),
-                'scaler_dist': loss_scaler_dist.state_dict(),
-                'args': args,
-            }
-
-            save_on_master(to_save, checkpoint_path)
-    else:
-        client_state = {'epoch': epoch}
-        model.save_checkpoint(save_dir=args.output_dir, tag="checkpoint-%s" % epoch_name, client_state=client_state)
 
 def save_model_classifier_loss(args, epoch, model, model_without_ddp, optimizer, loss_scaler):
     output_dir = Path(args.output_dir)

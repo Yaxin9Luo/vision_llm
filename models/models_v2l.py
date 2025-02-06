@@ -4,8 +4,6 @@ import pytorch_lightning as pl
 import importlib
 from einops import rearrange
 from torch.nn import Embedding
-from models.discriminator import NLayerDiscriminator, weights_init
-from models.lpips import LPIPS
 from models.encoder_decoder import Encoder, Decoder
 from transformers import GPT2Model, GPT2Config,GPT2LMHeadModel
 from transformers import RobertaModel, RobertaConfig
@@ -63,9 +61,7 @@ class VQModel_LLaMA(pl.LightningModule):
             param.requires_grad = False
         # 使用llm的embedding作为codebook
         self.register_buffer('codebook', self.llm.transformer.wte.weight.detach())
-        ####GPerceptual Loss 
-        self.perceptual_loss = LPIPS().eval()
-        self.perceptual_weight = args.rate_p    
+ 
     def quantize(self, z):
 
         # reshape z -> (batch, height, width, channel) and flatten
@@ -111,11 +107,10 @@ class VQModel_LLaMA(pl.LightningModule):
         quant_pred = hidden_states.reshape(N, H, W, -1).permute(0, 3, 1, 2)  # [8, 1024, 16, 16]
         dec = self.decode(quant_pred)
         rec_loss = torch.mean(torch.abs(input.contiguous() - dec.contiguous()))
-        p_loss = torch.mean(self.perceptual_loss(input.contiguous(), dec.contiguous()))
-        loss = rec_loss + self.args.rate_q * codebook_loss + \
-            self.perceptual_weight * p_loss + \
-            0.1 * next_token_loss if next_token_loss is not None else 0.0
-        return loss, rec_loss, codebook_loss, p_loss, next_token_loss, tk_labels, dec
+        loss = rec_loss + self.args.rate_q * codebook_loss
+        if next_token_loss is not None:
+            loss = loss + 0.1 * next_token_loss
+        return loss, rec_loss, codebook_loss, next_token_loss, tk_labels, dec
         
     def encode(self, h):
         quant, indices = self.quantize(h)
@@ -165,31 +160,7 @@ class VQModel_RoBERTa(pl.LightningModule):
         # Use llm's embedding as the codebook and move it to the correct device
         self.register_buffer('codebook', self.llm.embeddings.word_embeddings.weight.detach())
         
-        #### GAN & Perceptual Loss 
-        self.discriminator = NLayerDiscriminator(input_nc=3,
-                                    n_layers=2,
-                                    use_actnorm=False,
-                                    ndf=64
-                                    ).apply(weights_init)
-        self.perceptual_loss = LPIPS().eval()
-        self.perceptual_weight = args.rate_p    
 
-    def hinge_d_loss(self, logits_real, logits_fake):
-        loss_real = torch.mean(F.relu(1. - logits_real))
-        loss_fake = torch.mean(F.relu(1. + logits_fake))
-        d_loss = 0.5 * (loss_real + loss_fake)
-        return d_loss
-
-    def calculate_adaptive_weight(self, nll_loss, g_loss, discriminator_weight, last_layer=None):
-
-        nll_grads = torch.autograd.grad(nll_loss, last_layer, retain_graph=True)[0]
-        g_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
-
-        d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
-        d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
-        d_weight = d_weight * discriminator_weight
-        return d_weight
-    
     def quantize(self, z):
 
         # reshape z -> (batch, height, width, channel) and flatten
@@ -263,28 +234,9 @@ class VQModel_RoBERTa(pl.LightningModule):
         dec = self.decode(quant)
         # Loss calculation
         rec_loss = torch.mean(torch.abs(input.contiguous() - dec.contiguous()))
-        p_loss = torch.mean(self.perceptual_loss(input.contiguous(), dec.contiguous()))
-        if step == 0: #Upadte Generator
-            logits_fake = self.discriminator(dec)
-            g_loss = -torch.mean(logits_fake)
-            if is_val:
-                loss = rec_loss + self.args.rate_q * codebook_loss +self.perceptual_weight * p_loss + 0 * g_loss
-                return loss, rec_loss,codebook_loss, p_loss, g_loss, tk_labels.view(input.shape[0], -1), dec
-            
-            d_weight = self.calculate_adaptive_weight(rec_loss + self.perceptual_weight * p_loss, g_loss, self.args.rate_d, last_layer=self.decoder.conv_out.weight)
-            
-            if data_iter_step > self.args.disc_start:
-                loss = rec_loss  + self.args.rate_q * codebook_loss + self.perceptual_weight * p_loss + d_weight * g_loss
-            else:
-                loss = rec_loss + self.args.rate_q * codebook_loss + self.perceptual_weight * p_loss + 0 * g_loss
-            return loss, rec_loss, codebook_loss, p_loss, g_loss, tk_labels, dec
-        else: #Upadte Discriminator
-            logits_real =  self.discriminator(input.contiguous().detach().clone())
-            logits_fake = self.discriminator(dec.detach().clone())
-            d_loss = self.hinge_d_loss(logits_real, logits_fake)
-            loss = d_loss + 0 * (rec_loss  + p_loss)
+        loss = rec_loss + self.args.rate_q * codebook_loss
 
-            return loss, rec_loss, codebook_loss, p_loss, d_loss, tk_labels, dec
+        return loss, rec_loss, codebook_loss, tk_labels, dec
     def encode(self, h):
         quant, indices = self.quantize(h)
         return quant, indices
@@ -294,3 +246,29 @@ class VQModel_RoBERTa(pl.LightningModule):
         return dec
     def get_last_layer(self):
         return self.decoder.conv_out.weight
+
+    def get_input(self, batch, k):
+        x = batch[k]
+        if len(x.shape) == 3:
+            x = x[..., None]
+        x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format).float()
+        return x
+
+    def training_step(self, batch, batch_idx, optimizer_idx):
+        # 正常的训练步骤
+        x = self.get_input(batch, self.image_key)
+        xrec, loss = self(x)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x = self.get_input(batch, self.image_key)
+        xrec, loss = self(x)
+        return loss
+
+    def configure_optimizers(self):
+        opt = torch.optim.Adam(list(self.encoder.parameters()) +
+                             list(self.decoder.parameters()) +
+                             list(self.quant_conv.parameters()) +
+                             list(self.post_quant_conv.parameters()),
+                             lr=self.args.learning_rate)
+        return opt

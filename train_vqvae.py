@@ -115,12 +115,10 @@ def get_args_parser():
         help="Accumulate gradient iterations (for increasing the effective batch size under memory constraints)",
     )
     parser.add_argument("--stage", type=int, default=1, help="Pretraining stage")
-    # Model parameters
     parser.add_argument("--max_seq_len", type=int, default=512, metavar="LENGTH", help="the maximum sequence length")
 
     # Optimizer parameters
     parser.add_argument("--weight_decay", type=float, default=0.05, help="weight decay (default: 0.05)")
-
     parser.add_argument("--lr", type=float, default=4.5e-4, metavar="LR", help="learning rate (absolute lr)")
     parser.add_argument(
         "--blr",
@@ -132,22 +130,20 @@ def get_args_parser():
     parser.add_argument(
         "--min_lr", type=float, default=0.0, metavar="LR", help="lower lr bound for cyclic schedulers that hit 0"
     )
-
     parser.add_argument("--warmup_epochs", type=int, default=5, metavar="N", help="epochs to warmup LR")
 
     # Dataset parameters
-    parser.add_argument("--output_dir", default="./output_dir/vqvae_gpt2_next_token_prediction", help="path where to save, empty for no saving")
-    parser.add_argument("--log_dir", default="./output_dir/vqvae_gpt2_next_token_prediction", help="path where to tensorboard log")
+    parser.add_argument("--output_dir", default="./output_dir/vqvae_roberta_mae", help="path where to save")
+    parser.add_argument("--log_dir", default="./output_dir/vqvae_roberta_mae", help="path where to tensorboard log")
     parser.add_argument("--device", default="cuda", help="device to use for training / testing")
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--resume", default="", help="resume from checkpoint")
-
     parser.add_argument("--start_epoch", default=0, type=int, metavar="N", help="start epoch")
     parser.add_argument("--num_workers", default=0, type=int)
     parser.add_argument(
         "--pin_mem",
         action="store_true",
-        help="Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.",
+        help="Pin CPU memory in DataLoader for more efficient transfer to GPU.",
     )
     parser.add_argument("--no_pin_mem", action="store_false", dest="pin_mem")
     parser.set_defaults(pin_mem=True)
@@ -158,27 +154,14 @@ def get_args_parser():
     parser.add_argument("--local-rank", default=-1, type=int)
     parser.add_argument("--dist_on_itp", action="store_true")
     parser.add_argument("--dist_url", default="env://", help="url used to set up distributed training")
-
-    parser.add_argument("--imagenet_path", default="/root/autodl-tmp/ImageNet", type=str, help="imagenet_path")
-    parser.add_argument("--vqgan_path", default="vqgan_weight/vqgan_imagenet_f16_16384", type=str, help="path of llama model")
-    
+    parser.add_argument("--imagenet_path", default="/root/autodl-tmp/data/imagenet", type=str, help="imagenet_path")
     parser.add_argument("--n_vision_words", default=8192, type=int)
-    parser.add_argument("--output_type", default="next_token_prediction", type=str, help="next_token_prediction/classification")
-    parser.add_argument("--decode_rate", type=float, default=0, help="Decoding Loss")
     parser.add_argument("--n_class", default=1000, type=int)    
-    parser.add_argument("--vq_config_path", type=str, default="vqgan_configs/v2l.yaml", help="Decoding Loss")
-    parser.add_argument("--image_size", type=int, default=256, help="Decoding Loss")
-    parser.add_argument("--quantizer_type", type=str, default="org", help="Decoding Loss")
-
-    parser.add_argument("--embed_dim", type=int, default=1024, help="Decoding Loss")
-    parser.add_argument("--use_cblinear", type=int, default=0, help="Decoding Loss")
-    parser.add_argument("--use_crossatt_dec", type=int, default=0, help="Decoding Loss")
-    
-    parser.add_argument("--disc_start", default=10000, type=int)
-    parser.add_argument("--rate_q", type=float, default=1, help="Decoding Loss")
-    parser.add_argument("--rate_p", type=float, default=0.1, help="VGG Loss")
-    parser.add_argument("--rate_d", type=float, default=0.75, help="GAN Loss")
-
+    parser.add_argument("--vq_config_path", type=str, default="vqgan_configs/v2l.yaml", help="VQVAE config path")
+    parser.add_argument("--image_size", type=int, default=256, help="input image size")
+    parser.add_argument("--quantizer_type", type=str, default="org", help="quantizer type")
+    parser.add_argument("--embed_dim", type=int, default=1024, help="embedding dimension")
+    parser.add_argument("--rate_q", type=float, default=1, help="codebook loss weight")
 
     return parser
 
@@ -256,7 +239,7 @@ def main(args):
 
     config = load_config(args.vq_config_path, display=True)
 
-    model = VQModel_LLaMA(args=args, **config.model.params)
+    model = VQModel_RoBERTa(args=args, **config.model.params)
     model.to(device_id)
     # model.to(device)
     model_without_ddp = model
@@ -284,8 +267,8 @@ def main(args):
     loss_scaler_ae = NativeScaler()
 
     ##auto resume
-    if os.path.exists(os.path.join(args.output_dir, 'vqgan_checkpoint-last.pth')):
-        ckpt = torch.load(os.path.join(args.output_dir, 'vqgan_checkpoint-last.pth'), map_location="cpu")
+    if os.path.exists(os.path.join(args.output_dir, 'vqvae_checkpoint-last.pth')):
+        ckpt = torch.load(os.path.join(args.output_dir, 'vqvae_checkpoint-last.pth'), map_location="cpu")
         model_without_ddp.load_state_dict(ckpt["model"], strict=True)
         opt_ae.load_state_dict(ckpt["opt_ae"])
         loss_scaler_ae.load_state_dict(ckpt["scaler_ae"])
@@ -311,7 +294,7 @@ def main(args):
             model, data_loader_train, optimizer, device, epoch, loss_scaler, log_writer=log_writer, args=args
         )
 
-        misc.save_model_last_vqgan(
+        misc.save_model_last_vqvae(
                 args=args,
                 model=model,
                 model_without_ddp=model_without_ddp,
@@ -321,7 +304,7 @@ def main(args):
         )
         
         if args.output_dir and (epoch % 10 == 0 or epoch + 1 == args.epochs):
-            misc.save_model_vqgan(
+            misc.save_model_vqvae(
                 args=args,
                 model=model,
                 model_without_ddp=model_without_ddp,

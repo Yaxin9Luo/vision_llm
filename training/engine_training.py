@@ -28,9 +28,6 @@ def train_one_epoch(
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
-    ##
-    #metric_logger.add_meter("acc", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
-    ##
     header = "Epoch: [{}]".format(epoch)
     print_freq = 10
 
@@ -46,12 +43,12 @@ def train_one_epoch(
     ):
         cur_iter = len(data_loader) * epoch + data_iter_step
 
-        ####Tokenizer with VQ-GAN
+        ####Tokenizer with VQ-VAE
         b = images.shape[0]
         x = images.to(device)
         label_cls = label_cls.to(device)
 
-        loss, rec_loss, codebook_loss, p_loss, next_token_loss, tk_labels, dec = model(x, cur_iter, step=0)
+        loss, rec_loss, codebook_loss, tk_labels, dec = model(x, cur_iter, step=0)
         opt_ae.zero_grad() 
 
         lr_sched.adjust_learning_rate(opt_ae, data_iter_step / len(data_loader) + epoch, args)
@@ -61,11 +58,6 @@ def train_one_epoch(
                                     list(model.quant_conv.parameters())+
                                     list(model.post_quant_conv.parameters()), 
                                     update_grad=(data_iter_step + 1) % accum_iter == 0)
-        # if cur_iter > args.disc_start and args.rate_d != 0:
-        #     d_loss, _, _,_, _, _, _ = model(x, cur_iter, step=1)
-        #     opt_disc.zero_grad()
-        #     lr_sched.adjust_learning_rate(opt_disc, data_iter_step / len(data_loader) + epoch, args)
-        #     loss_scaler_disc(d_loss, opt_disc, parameters=model.discriminator.parameters(), update_grad=(data_iter_step + 1) % accum_iter == 0)
 
         torch.cuda.synchronize()
         
@@ -82,21 +74,7 @@ def train_one_epoch(
         misc.all_reduce_mean(recloss_value)
         recloss_value_reduce = misc.all_reduce_mean(recloss_value)
 
-        next_token_loss_value = next_token_loss.item()
-        metric_logger.update(next_token_loss=next_token_loss_value)
-        misc.all_reduce_mean(next_token_loss_value)
-        next_token_loss_value_reduce = misc.all_reduce_mean(next_token_loss_value)
 
-        # if cur_iter > args.disc_start and args.rate_d != 0:
-        #     dloss_value = d_loss.item()
-        #     metric_logger.update(dloss=dloss_value)
-        #     misc.all_reduce_mean(dloss_value)
-        #     dloss_value_reduce = misc.all_reduce_mean(dloss_value)
-
-        p_loss_value = p_loss.item()
-        metric_logger.update(p_loss=p_loss_value)
-        misc.all_reduce_mean(p_loss_value)
-        p_loss_value_reduce = misc.all_reduce_mean(p_loss_value)
         codebook_loss_value = codebook_loss.item()
         metric_logger.update(codebook_loss=codebook_loss_value)
         misc.all_reduce_mean(codebook_loss_value)
@@ -111,21 +89,13 @@ def train_one_epoch(
             log_writer.add_scalar("Iter/Loss", loss_value_reduce, epoch_1000x)
             log_writer.add_scalar("Iter/REC Loss", recloss_value_reduce, epoch_1000x)
             log_writer.add_scalar("Iter/Codebook Loss", codebook_loss_value_reduce, epoch_1000x)
-            log_writer.add_scalar("Iter/VGG Loss", p_loss_value_reduce, epoch_1000x)
-            log_writer.add_scalar("Iter/Next Token Loss", next_token_loss_value_reduce, epoch_1000x)
-            # if cur_iter > args.disc_start and args.rate_d != 0:
-            #     log_writer.add_scalar("Iter/Discriminator Loss", dloss_value_reduce, epoch_1000x)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     if log_writer is not None:
         log_writer.add_scalar("Epoch/Loss", loss_value_reduce, epoch)
         log_writer.add_scalar("Epoch/REC Loss", recloss_value_reduce, epoch)
-        log_writer.add_scalar("Epoch/VGG Loss", p_loss_value_reduce, epoch)
         log_writer.add_scalar("Epoch/Codebook Loss", codebook_loss_value_reduce, epoch)
-        log_writer.add_scalar("Epoch/Next Token Loss", next_token_loss_value_reduce, epoch)
-        # if cur_iter > args.disc_start and args.rate_d != 0:
-        #     log_writer.add_scalar("Epoch/Discriminator Loss", dloss_value_reduce, epoch)
             
         save_x = (x-x.min())/(x.max()-x.min())#self.to_rgb(x)
         save_xrec = (dec-dec.min())/(dec.max()-dec.min())
