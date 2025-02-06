@@ -20,7 +20,7 @@ from models.models_v2l import VQModel_LLaMA,VQModel_RoBERTa
 from training.engine_training import train_one_epoch
 import util.misc as misc
 import socket
-
+from torchvision import datasets, transforms
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 def load_config(config_path, display=False):
@@ -41,73 +41,57 @@ def preprocess_vqgan(x):
   x = 2.*x - 1.
   return x
 
-
-class ImageNetDataset(Dataset):
-    def __init__(self, data_root, image_size, max_words=30, n_class=1000, partition="train", device="cpu", use_subset=0.05):
-        self.max_words = max_words
+class CIFAR10Dataset(Dataset):
+    def __init__(self, partition="train", device="cpu"):
         self.device = device
-        self.image_size = image_size
-
-        self.data_root = data_root
-        _, self.clip_preprocessing = clip.load("ViT-L/14")
-
-        self.rescaler = albumentations.SmallestMaxSize(max_size=128)
-        self.cropper = albumentations.RandomCrop(height=128, width=128)
-        self.preprocessor = albumentations.Compose([self.rescaler, self.cropper])
-
-        self.token_nums = [1, 4, 16, 64, 256, 256]
-
         self.partition = partition
-
+        
+        # CLIP preprocessing
+        _, self.clip_preprocessing = clip.load("ViT-L/14")
+        
+        # CLIP normalization parameters
         self.clip_mean = torch.from_numpy(np.array([0.48145466, 0.4578275, 0.40821073])).unsqueeze(0).unsqueeze(-1).unsqueeze(-1).float()
         self.clip_std = torch.from_numpy(np.array([0.26862954, 0.26130258, 0.27577711])).unsqueeze(0).unsqueeze(-1).unsqueeze(-1).float()
-
-        self.image_ids = []
-        self.class_labels = []
-
-        partition_dir = os.path.join(self.data_root, partition)
-        class_dirs = [d for d in os.listdir(partition_dir) if os.path.isdir(os.path.join(partition_dir, d))]
         
-        for class_label, class_dir in enumerate(class_dirs):
-            if class_label >= n_class:
-                break
-            class_path = os.path.join(partition_dir, class_dir)
-            image_files = [f for f in os.listdir(class_path) if f.endswith(('.JPEG', '.jpg', '.png'))]
-            subset_size = max(1, int(len(image_files) * use_subset))
-            selected_images = np.random.choice(image_files, subset_size, replace=False)
-            
-            for image_file in selected_images:
-                self.image_ids.append(os.path.join(class_dir, image_file))
-                self.class_labels.append(class_label)
-
-        print(f"Using {len(self.image_ids)} images for {partition} set")
+        # Load CIFAR10
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+        
+        self.dataset = datasets.CIFAR10(
+            root='./data', 
+            train=(partition == "train"),
+            download=True, 
+            transform=transform
+        )
 
     def __len__(self):
-        return len(self.image_ids)
+        return len(self.dataset)
 
     def __getitem__(self, index):
-        image_id = self.image_ids[index]
-        image_path = os.path.join(self.data_root, self.partition, image_id)
-        image = Image.open(image_path).convert('RGB')
+        image, label = self.dataset[index]
+        image = Image.fromarray(np.uint8(image.permute(1,2,0).numpy() * 255))
+        
+        # Apply CLIP preprocessing
         clip_image = self.clip_preprocessing(image)
-        label = self.class_labels[index]
-
+        
+        # Process input for VQVAE
         input = torch.nn.functional.interpolate(clip_image.unsqueeze(0), size=(128, 128), mode='bilinear', align_corners=False).contiguous()
         input = self.clip_std * input + self.clip_mean
         input = 2 * input - 1
         input = input.squeeze(0)
-
-        return [image_id, input, clip_image, label]
+        
+        return [str(index), input, clip_image, label]
 
 def get_args_parser():
     parser = argparse.ArgumentParser("MAE pre-training", add_help=False)
     parser.add_argument(
         "--batch_size",
-        default=8,
+        default=16,
         type=int,
         help="Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus",
     )
-    parser.add_argument("--epochs", default=400, type=int)
+    parser.add_argument("--epochs", default=100, type=int)
     parser.add_argument(
         "--accum_iter",
         default=1,
@@ -156,7 +140,7 @@ def get_args_parser():
     parser.add_argument("--dist_url", default="env://", help="url used to set up distributed training")
     parser.add_argument("--imagenet_path", default="/root/autodl-tmp/data/imagenet", type=str, help="imagenet_path")
     parser.add_argument("--n_vision_words", default=8192, type=int)
-    parser.add_argument("--n_class", default=1000, type=int)    
+    parser.add_argument("--n_class", default=10, type=int)    # CIFAR10有10个类别
     parser.add_argument("--vq_config_path", type=str, default="vqgan_configs/v2l.yaml", help="VQVAE config path")
     parser.add_argument("--image_size", type=int, default=256, help="input image size")
     parser.add_argument("--quantizer_type", type=str, default="org", help="quantizer type")
@@ -190,11 +174,13 @@ def main(args):
     else:
         rank = 0
         device_id = 0
-    dataset_train = ImageNetDataset(
-        data_root=args.imagenet_path, image_size=args.image_size, max_words=args.max_seq_len, n_class=args.n_class, partition="train", device=device,use_subset=0.02
+    dataset_train = CIFAR10Dataset(
+        partition="train", 
+        device=device
     )
-    dataset_val = ImageNetDataset(
-        data_root=args.imagenet_path, image_size=args.image_size, max_words=args.max_seq_len, n_class=args.n_class, partition="val", device=device,use_subset=0.02
+    dataset_val = CIFAR10Dataset(
+        partition="val", 
+        device=device
     )
 
     if True:  # args.distributed:
@@ -280,7 +266,7 @@ def main(args):
     optimizer = opt_ae
     loss_scaler = loss_scaler_ae
 
-    num_val_images = len(dataset_val.image_ids)
+    num_val_images = len(dataset_val)
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()

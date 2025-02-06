@@ -26,9 +26,13 @@ def train_one_epoch(
 
     opt_ae = optimizer
     loss_scaler_ae = loss_scaler
-    #optimizer.zero_grad()
+    
     if log_writer is not None:
         print("log_dir: {}".format(log_writer.log_dir))
+        
+    # 获取实际模型（处理DDP包装的情况）
+    actual_model = model.module if hasattr(model, 'module') else model
+        
     for data_iter_step, [image_ids, images, clip_images, label_cls] in enumerate(
         metric_logger.log_every(data_loader, print_freq, header)
     ):
@@ -44,10 +48,10 @@ def train_one_epoch(
 
         lr_sched.adjust_learning_rate(opt_ae, data_iter_step / len(data_loader) + epoch, args)
 
-        loss_scaler_ae(loss, opt_ae, parameters=list(model.encoder.parameters())+
-                                    list(model.decoder.parameters())+
-                                    list(model.quant_conv.parameters())+
-                                    list(model.post_quant_conv.parameters()), 
+        loss_scaler_ae(loss, opt_ae, parameters=list(actual_model.encoder.parameters())+
+                                    list(actual_model.decoder.parameters())+
+                                    list(actual_model.quant_conv.parameters())+
+                                    list(actual_model.post_quant_conv.parameters()), 
                                     update_grad=(data_iter_step + 1) % accum_iter == 0)
 
         torch.cuda.synchronize()
@@ -65,22 +69,18 @@ def train_one_epoch(
         misc.all_reduce_mean(recloss_value)
         recloss_value_reduce = misc.all_reduce_mean(recloss_value)
 
-
         codebook_loss_value = codebook_loss.item()
         metric_logger.update(codebook_loss=codebook_loss_value)
         misc.all_reduce_mean(codebook_loss_value)
         codebook_loss_value_reduce = misc.all_reduce_mean(codebook_loss_value)
 
-        """We use epoch_1000x as the x-axis in tensorboard.
-        This calibrates different curves when batch size changes.
-        """
         if log_writer is not None and cur_iter % 1000 == 0:
             epoch_1000x = int(cur_iter)
             log_writer.add_scalar("Iter/lr", lr, epoch_1000x)
             log_writer.add_scalar("Iter/Loss", loss_value_reduce, epoch_1000x)
             log_writer.add_scalar("Iter/REC Loss", recloss_value_reduce, epoch_1000x)
             log_writer.add_scalar("Iter/Codebook Loss", codebook_loss_value_reduce, epoch_1000x)
-    # gather the stats from all processes
+            
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     if log_writer is not None:
@@ -88,12 +88,10 @@ def train_one_epoch(
         log_writer.add_scalar("Epoch/REC Loss", recloss_value_reduce, epoch)
         log_writer.add_scalar("Epoch/Codebook Loss", codebook_loss_value_reduce, epoch)
             
-        save_x = (x-x.min())/(x.max()-x.min())#self.to_rgb(x)
+        save_x = (x-x.min())/(x.max()-x.min())
         save_xrec = (dec-dec.min())/(dec.max()-dec.min())
         save_img = torch.cat([save_x, save_xrec], dim=-1).detach().cpu().numpy()
         for b in range(0, save_img.shape[0]):
             mlflow.log_image(save_img[b].transpose(1, 2, 0), "recons_%s_%s.png"%(epoch, b))
-    
-
 
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}

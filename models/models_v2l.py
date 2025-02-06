@@ -153,8 +153,8 @@ class VQModel_RoBERTa(pl.LightningModule):
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
         
         # RoBERTa Configuration
-        self.llm_config = RobertaConfig.from_pretrained('/root/autodl-tmp/roberta-large')
-        self.llm = RobertaModel.from_pretrained('/root/autodl-tmp/roberta-large', config=self.llm_config)
+        self.llm_config = RobertaConfig.from_pretrained('FacebookAI/roberta-large')
+        self.llm = RobertaModel.from_pretrained('FacebookAI/roberta-large', config=self.llm_config)
         for param in self.llm.parameters():
             param.requires_grad = False
         # Use llm's embedding as the codebook and move it to the correct device

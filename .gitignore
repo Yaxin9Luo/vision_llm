@@ -21,7 +21,8 @@ __pycache__/
 .mlruns/
 # Ignore log files
 *.log
-
+/data/
 # Ignore OS generated files
 .DS_Store
 Thumbs.db
+/output_dir
