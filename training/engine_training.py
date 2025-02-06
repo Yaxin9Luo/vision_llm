@@ -1,19 +1,10 @@
-import math
-import sys
 from typing import Iterable
 from tqdm import tqdm  
 import torch
 import util.lr_sched as lr_sched
 import util.misc as misc
-import copy
-from timm.utils import accuracy
-import numpy as np
 import mlflow
-from einops import rearrange
-import matplotlib.pyplot as plt
-import os
 from torch.nn import functional as F
-from training import utils
 def train_one_epoch(
     model: torch.nn.Module,
     data_loader: Iterable,

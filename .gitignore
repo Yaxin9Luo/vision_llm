@@ -5,8 +5,6 @@
 *.gif
 *.bmp
 
-# Ignore text files
-*.txt
 
 # Ignore binary files
 *.bin
