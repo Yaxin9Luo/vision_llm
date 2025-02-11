@@ -84,6 +84,9 @@ def train_one_epoch(
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
     if log_writer is not None:
+        active_run = mlflow.active_run()
+        if active_run is None:
+            mlflow.start_run()
         log_writer.add_scalar("Epoch/Loss", loss_value_reduce, epoch)
         log_writer.add_scalar("Epoch/REC Loss", recloss_value_reduce, epoch)
         log_writer.add_scalar("Epoch/Codebook Loss", codebook_loss_value_reduce, epoch)

@@ -165,14 +165,44 @@ def get_args_parser():
     return parser
 
 def main(args):
+    # 添加 MLflow 配置
+    import mlflow
+    import os
 
-    misc.init_distributed_mode(args)
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(args.log_dir, exist_ok=True)
-
-    print("job dir: {}".format(os.path.dirname(os.path.realpath(__file__))))
-    print("{}".format(args).replace(", ", ",\n"))
+    mlflow_tracking_path = os.path.expanduser("/l/users/yaxin.luo/vision_llm/mlruns") 
+    os.makedirs(mlflow_tracking_path, exist_ok=True)
+    mlflow.set_tracking_uri(f"file://{mlflow_tracking_path}")
+    
+    # 创建或获取实验
+    experiment_name = "vqvae_training"
+    try:
+        experiment = mlflow.get_experiment_by_name(experiment_name)
+        if experiment is None:
+            experiment_id = mlflow.create_experiment(experiment_name)
+        else:
+            experiment_id = experiment.experiment_id
+    except:
+        experiment_id = mlflow.create_experiment(experiment_name)
+    
+    # 开始新的运行
+    mlflow.start_run(experiment_id=experiment_id)
+    if args.distributed:
+        if 'MASTER_ADDR' not in os.environ:
+            os.environ['MASTER_ADDR'] = 'localhost'
+        if 'MASTER_PORT' not in os.environ:
+            os.environ['MASTER_PORT'] = '12345'
+        if 'RANK' not in os.environ:
+            os.environ['RANK'] = '0'
+        if 'WORLD_SIZE' not in os.environ:
+            os.environ['WORLD_SIZE'] = '1'
+        if 'LOCAL_RANK' not in os.environ:
+            os.environ['LOCAL_RANK'] = '0'
+        misc.init_distributed_mode(args)
+    else:
+        args.distributed = False
+        args.world_size = 1
+        args.rank = 0
+        args.local_rank = 0
 
     device = torch.device(args.device)
     seed = args.seed + misc.get_rank()
@@ -283,49 +313,52 @@ def main(args):
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-    for epoch in range(args.start_epoch, args.epochs):
+    try:
+        for epoch in range(args.start_epoch, args.epochs):
 
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
-            data_loader_val.sampler.set_epoch(epoch)
+            if args.distributed:
+                data_loader_train.sampler.set_epoch(epoch)
+                data_loader_val.sampler.set_epoch(epoch)
 
-        train_stats = train_one_epoch(
-            model, data_loader_train, optimizer, device, epoch, loss_scaler, log_writer=log_writer, args=args
-        )
-
-        misc.save_model_last_vqvae(
-                args=args,
-                model=model,
-                model_without_ddp=model_without_ddp,
-                optimizer=optimizer,
-                loss_scaler=loss_scaler,
-                epoch=epoch,
-        )
-        
-        if args.output_dir and (epoch % 10 == 0 or epoch + 1 == args.epochs):
-            misc.save_model_vqvae(
-                args=args,
-                model=model,
-                model_without_ddp=model_without_ddp,
-                optimizer=optimizer,
-                loss_scaler=loss_scaler,
-                epoch=epoch,
+            train_stats = train_one_epoch(
+                model, data_loader_train, optimizer, device, epoch, loss_scaler, log_writer=log_writer, args=args
             )
 
-        log_stats = {
-            **{f"train_{k}": v for k, v in train_stats.items()},
-            "epoch": epoch#,
-        }
+            misc.save_model_last_vqvae(
+                    args=args,
+                    model=model,
+                    model_without_ddp=model_without_ddp,
+                    optimizer=optimizer,
+                    loss_scaler=loss_scaler,
+                    epoch=epoch,
+            )
+            
+            if args.output_dir and (epoch % 10 == 0 or epoch + 1 == args.epochs):
+                misc.save_model_vqvae(
+                    args=args,
+                    model=model,
+                    model_without_ddp=model_without_ddp,
+                    optimizer=optimizer,
+                    loss_scaler=loss_scaler,
+                    epoch=epoch,
+                )
 
-        if args.output_dir and misc.is_main_process():
-            if log_writer is not None:
-                log_writer.flush()
-            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-                f.write(json.dumps(log_stats) + "\n")
+            log_stats = {
+                **{f"train_{k}": v for k, v in train_stats.items()},
+                "epoch": epoch#,
+            }
 
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print("Training time {}".format(total_time_str))
+            if args.output_dir and misc.is_main_process():
+                if log_writer is not None:
+                    log_writer.flush()
+                with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+                    f.write(json.dumps(log_stats) + "\n")
+
+        total_time = time.time() - start_time
+        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+        print("Training time {}".format(total_time_str))
+    finally:
+        mlflow.end_run()
 
 if __name__ == "__main__":
 

@@ -1,0 +1,6 @@
+artifact_location: file:///l/users/yaxin.luo/vision_llm/mlruns/329504636749209401
+creation_time: 1739207734823
+experiment_id: '329504636749209401'
+last_update_time: 1739207734823
+lifecycle_stage: active
+name: vqvae_training

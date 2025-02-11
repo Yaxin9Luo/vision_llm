@@ -1,0 +1,15 @@
+artifact_uri: file:///l/users/yaxin.luo/vision_llm/mlruns/329504636749209401/61b08e87bd4d44688373244b81827b9c/artifacts
+end_time: null
+entry_point_name: ''
+experiment_id: '329504636749209401'
+lifecycle_stage: active
+run_id: 61b08e87bd4d44688373244b81827b9c
+run_name: nervous-loon-862
+run_uuid: 61b08e87bd4d44688373244b81827b9c
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1739207735004
+status: 1
+tags: []
+user_id: yaxin.luo
