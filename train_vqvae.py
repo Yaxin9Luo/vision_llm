@@ -220,10 +220,10 @@ def main(args):
         rank = 0
         device_id = 0
     dataset_train = ImageNetDataset(
-        data_root=args.imagenet_path, image_size=args.image_size, max_words=args.max_seq_len, n_class=args.n_class, partition="train", device=device,use_subset=0.02
+        data_root=args.imagenet_path, image_size=args.image_size, max_words=args.max_seq_len, n_class=args.n_class, partition="train", device=device,use_subset=1.0
     )
     dataset_val = ImageNetDataset(
-        data_root=args.imagenet_path, image_size=args.image_size, max_words=args.max_seq_len, n_class=args.n_class, partition="val", device=device,use_subset=0.02
+        data_root=args.imagenet_path, image_size=args.image_size, max_words=args.max_seq_len, n_class=args.n_class, partition="val", device=device,use_subset=1.0
     )
 
     if True:  # args.distributed:
