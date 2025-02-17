@@ -47,11 +47,11 @@ class CIFAR10Dataset(Dataset):
         self.partition = partition
         
         # CLIP preprocessing
-        _, self.clip_preprocessing = clip.load("ViT-L/14")
+        _, self.clip_preprocessing = clip.load("ViT-L/14", device='cpu')  # 强制在CPU上加载CLIP
         
         # CLIP normalization parameters
-        self.clip_mean = torch.from_numpy(np.array([0.48145466, 0.4578275, 0.40821073])).unsqueeze(0).unsqueeze(-1).unsqueeze(-1).float()
-        self.clip_std = torch.from_numpy(np.array([0.26862954, 0.26130258, 0.27577711])).unsqueeze(0).unsqueeze(-1).unsqueeze(-1).float()
+        self.clip_mean = torch.from_numpy(np.array([0.48145466, 0.4578275, 0.40821073])).float()
+        self.clip_std = torch.from_numpy(np.array([0.26862954, 0.26130258, 0.27577711])).float()
         
         # Load CIFAR10
         transform = transforms.Compose([
@@ -59,7 +59,7 @@ class CIFAR10Dataset(Dataset):
         ])
         
         self.dataset = datasets.CIFAR10(
-            root='./data', 
+            root='/home/yaxin/data', 
             train=(partition == "train"),
             download=True, 
             transform=transform
@@ -69,19 +69,32 @@ class CIFAR10Dataset(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, index):
-        image, label = self.dataset[index]
-        image = Image.fromarray(np.uint8(image.permute(1,2,0).numpy() * 255))
-        
-        # Apply CLIP preprocessing
-        clip_image = self.clip_preprocessing(image)
-        
-        # Process input for VQVAE
-        input = torch.nn.functional.interpolate(clip_image.unsqueeze(0), size=(128, 128), mode='bilinear', align_corners=False).contiguous()
-        input = self.clip_std * input + self.clip_mean
-        input = 2 * input - 1
-        input = input.squeeze(0)
-        
-        return [str(index), input, clip_image, label]
+        try:
+            image, label = self.dataset[index]
+            image = Image.fromarray(np.uint8(image.permute(1,2,0).numpy() * 255))
+            
+            # Apply CLIP preprocessing
+            with torch.no_grad():  # 减少内存使用
+                clip_image = self.clip_preprocessing(image)
+            
+            # Process input for VQVAE
+            with torch.cuda.amp.autocast():  # 使用混合精度
+                input = torch.nn.functional.interpolate(
+                    clip_image.unsqueeze(0), 
+                    size=(128, 128), 
+                    mode='bilinear', 
+                    align_corners=False
+                ).contiguous()
+                input = self.clip_std.to(input.device).unsqueeze(0).unsqueeze(-1).unsqueeze(-1) * input + \
+                       self.clip_mean.to(input.device).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                input = 2 * input - 1
+                input = input.squeeze(0)
+            
+            return [str(index), input, clip_image, label]
+        except Exception as e:
+            print(f"Error processing index {index}: {str(e)}")
+            # 返回一个替代样本
+            return self.__getitem__((index + 1) % len(self))
 
 def get_args_parser():
     parser = argparse.ArgumentParser("MAE pre-training", add_help=False)
@@ -100,7 +113,9 @@ def get_args_parser():
     )
     parser.add_argument("--stage", type=int, default=1, help="Pretraining stage")
     parser.add_argument("--max_seq_len", type=int, default=512, metavar="LENGTH", help="the maximum sequence length")
-
+    parser.add_argument("--use_mod", type=bool, default=True, help="use MoD for masking")
+    parser.add_argument("--capacity_factor", type=float, default=0.5, help="capacity factor for MoD")
+    parser.add_argument("--router_aux_loss_coef", type=float, default=0.01, help="auxiliary loss coefficient for router")
     # Optimizer parameters
     parser.add_argument("--weight_decay", type=float, default=0.05, help="weight decay (default: 0.05)")
     parser.add_argument("--lr", type=float, default=4.5e-4, metavar="LR", help="learning rate (absolute lr)")
@@ -254,10 +269,12 @@ def main(args):
 
     ##auto resume
     if os.path.exists(os.path.join(args.output_dir, 'vqvae_checkpoint-last.pth')):
-        ckpt = torch.load(os.path.join(args.output_dir, 'vqvae_checkpoint-last.pth'), map_location="cpu")
+        ckpt = torch.load(os.path.join(args.output_dir, 'vqvae_checkpoint-last.pth'), 
+                        map_location="cpu",
+                        weights_only=False)
         model_without_ddp.load_state_dict(ckpt["model"], strict=True)
-        opt_ae.load_state_dict(ckpt["opt_ae"])
-        loss_scaler_ae.load_state_dict(ckpt["scaler_ae"])
+        opt_ae.load_state_dict(ckpt["optimizer"])
+        loss_scaler_ae.load_state_dict(ckpt["scaler"])
         args = ckpt["args"]
         args.start_epoch = ckpt["epoch"] + 1
         print(args)

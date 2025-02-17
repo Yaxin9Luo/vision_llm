@@ -410,7 +410,7 @@ def save_model_classifier_loss(args, epoch, model, model_without_ddp, optimizer,
             to_save = {
                 'model': model_without_ddp.state_dict(),
                 # 'projector': projector_without_ddp.state_dict(),
-                'opt_ae': opt_ae.state_dict(),
+                'optimizer': opt_ae.state_dict(),
                 'epoch': epoch,
                 'scaler_ae': loss_scaler_ae.state_dict(),
                 'args': args,

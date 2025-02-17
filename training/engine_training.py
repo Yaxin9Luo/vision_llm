@@ -44,6 +44,15 @@ def train_one_epoch(
         label_cls = label_cls.to(device)
 
         loss, rec_loss, codebook_loss, tk_labels, dec = model(x, cur_iter, step=0)
+        
+        # MoD aux_loss
+        if hasattr(actual_model, 'use_mod') and actual_model.use_mod and actual_model.training:
+            aux_loss = actual_model.last_aux_loss  # 需要在model中保存最后的aux_loss
+            aux_loss_value = aux_loss.item()
+            metric_logger.update(aux_loss=aux_loss_value)
+            misc.all_reduce_mean(aux_loss_value)
+            aux_loss_value_reduce = misc.all_reduce_mean(aux_loss_value)
+        
         opt_ae.zero_grad() 
 
         lr_sched.adjust_learning_rate(opt_ae, data_iter_step / len(data_loader) + epoch, args)
@@ -80,6 +89,8 @@ def train_one_epoch(
             log_writer.add_scalar("Iter/Loss", loss_value_reduce, epoch_1000x)
             log_writer.add_scalar("Iter/REC Loss", recloss_value_reduce, epoch_1000x)
             log_writer.add_scalar("Iter/Codebook Loss", codebook_loss_value_reduce, epoch_1000x)
+            if hasattr(actual_model, 'use_mod') and actual_model.use_mod and actual_model.training:
+                log_writer.add_scalar("Iter/Router Aux Loss", aux_loss_value_reduce, epoch_1000x)
             
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -87,6 +98,8 @@ def train_one_epoch(
         log_writer.add_scalar("Epoch/Loss", loss_value_reduce, epoch)
         log_writer.add_scalar("Epoch/REC Loss", recloss_value_reduce, epoch)
         log_writer.add_scalar("Epoch/Codebook Loss", codebook_loss_value_reduce, epoch)
+        if hasattr(actual_model, 'use_mod') and actual_model.use_mod and actual_model.training:
+            log_writer.add_scalar("Epoch/Router Aux Loss", aux_loss_value_reduce, epoch)
             
         save_x = (x-x.min())/(x.max()-x.min())
         save_xrec = (dec-dec.min())/(dec.max()-dec.min())

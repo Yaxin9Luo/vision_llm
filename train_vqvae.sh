@@ -1,13 +1,18 @@
 #!/bin/bash
-
-export NUM_GPUS=$(nvidia-smi --query-gpu=gpu_name --format=csv,noheader | wc -l)
+export CUDA_VISIBLE_DEVICES=0,1
 
 torchrun \
-    --nproc_per_node=$NUM_GPUS \
+    --nproc_per_node=2 \
     --master_port=29500 \
+    --nnodes=1 \
+    --node_rank=0 \
     train_vqvae.py \
-    --batch_size=8 \
+    --batch_size=16 \
+    --num_workers=24 \
     --epochs=400 \
     --distributed \
-    --output_dir="./output_dir/vqvae_cifar10" \
-    --log_dir="./output_dir/vqvae_cifar10" 
+    --use_mod True \
+    --capacity_factor=0.75 \
+    --router_aux_loss_coef=0.01 \
+    --output_dir="./output_dir/mod_vqvae_roberta_cifar10" \
+    --log_dir="./output_dir/mod_vqvae_roberta_cifar10" 

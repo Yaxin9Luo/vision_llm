@@ -7,6 +7,7 @@ from torch.nn import Embedding
 from models.encoder_decoder import Encoder, Decoder
 from transformers import GPT2Model, GPT2Config,GPT2LMHeadModel
 from transformers import RobertaModel, RobertaConfig
+import torch.nn as nn
 
     
 def get_obj_from_str(string, reload=False):
@@ -135,7 +136,7 @@ class VQModel_RoBERTa(pl.LightningModule):
                  colorize_nlabels=None,
                  monitor=None,
                  remap=None,
-                 sane_index_shape=False,  # tell vector quantizer to return indices as bhw
+                 sane_index_shape=False,
                  ):
         super().__init__()
         self.image_key = image_key
@@ -157,9 +158,19 @@ class VQModel_RoBERTa(pl.LightningModule):
         self.llm = RobertaModel.from_pretrained('FacebookAI/roberta-large', config=self.llm_config)
         for param in self.llm.parameters():
             param.requires_grad = False
-        # Use llm's embedding as the codebook and move it to the correct device
-        self.register_buffer('codebook', self.llm.embeddings.word_embeddings.weight.detach())
         
+        # 添加router相关配置
+        self.use_mod = getattr(args, 'use_mod', True)
+        self.capacity_factor = getattr(args, 'capacity_factor', 0.5)
+        self.router_aux_loss_coef = getattr(args, 'router_aux_loss_coef', 0.01)
+        
+        # 添加router
+        if self.use_mod:
+            self.router = nn.Linear(embed_dim, 2, bias=False)
+        
+        # Use llm's embedding as the codebook
+        self.register_buffer('codebook', self.llm.embeddings.word_embeddings.weight.detach())
+        self.last_aux_loss = None  # 添加aux_loss保存
 
     def quantize(self, z):
 
@@ -186,40 +197,52 @@ class VQModel_RoBERTa(pl.LightningModule):
                 z_q.shape[0], z_q.shape[2], z_q.shape[3])
 
         return z_q, min_encoding_indices, codebook_loss
-    def random_masking(self, x, mask_ratio):
+
+    def mod_masking(self, x):
+        """使用router替代random masking"""
         N, C, H, W = x.shape
         L = H * W
-        len_keep = int(L * (1 - mask_ratio))
         
-        noise = torch.rand(N, L, device=x.device)
-        ids_shuffle = torch.argsort(noise, dim=1)
-        ids_restore = torch.argsort(ids_shuffle, dim=1)
-
-        ids_keep = ids_shuffle[:, :len_keep]
-
-        # Flatten spatial dimensions
-        x_flattened = x.flatten(2)
-
-        # Create a mask for kept indices
+        # 将输入reshape为序列形式以便router处理
+        x_seq = x.permute(0, 2, 3, 1).reshape(N, L, C)
+        
+        # 使用router预测token的重要性
+        router_logits = self.router(x_seq)  # [N, L, 2]
+        route_probabilities = F.softmax(router_logits, dim=-1)[:, :, 1]
+        
+        # 选择top-k个token
+        len_keep = int(L * self.capacity_factor)
+        token_weights, ids_keep = torch.topk(route_probabilities, len_keep, dim=1)
+        
+        # 创建mask
         mask = torch.zeros(N, L, device=x.device)
         mask.scatter_(1, ids_keep, 1)
-
-        # Apply masking
-        x_masked = x_flattened * mask.unsqueeze(1)
-
-        # Reshape back to original shape
+        
+        # 应用mask
+        x_masked = x.flatten(2) * mask.unsqueeze(1)
         x_masked = x_masked.view(N, C, H, W)
+        
+        # 计算router的辅助损失
+        router_targets = torch.zeros_like(route_probabilities)
+        router_targets.scatter_(1, ids_keep, 1)
+        aux_loss = F.cross_entropy(router_logits.view(-1, 2), router_targets.view(-1).long())
+        
+        # 返回masked结果和辅助损失
+        return x_masked, 1 - mask, ids_keep, aux_loss
 
-        # Create binary mask (1 is remove, 0 is keep)
-        mask = 1 - mask
-
-        return x_masked, mask, ids_restore
     def forward(self, input, data_iter_step, step=0, is_val=False, k=21):
-                   
         encoder_feature = self.quant_conv(self.encoder(input))
         quant, tk_labels, codebook_loss = self.quantize(encoder_feature)
-        # Apply random masking
-        quant_masked, mask, ids_restore = self.random_masking(quant, mask_ratio=0.5)
+        
+        # 使用router进行masking
+        if self.use_mod and self.training:
+            quant_masked, mask, ids_keep, aux_loss = self.mod_masking(quant)
+            self.last_aux_loss = aux_loss  # 保存aux_loss供训练循环使用
+        else:
+            quant_masked, mask, ids_restore = self.random_masking(quant, mask_ratio=0.5)
+            aux_loss = torch.tensor(0.0, device=quant.device)
+            self.last_aux_loss = aux_loss
+        
         # Reshape quant for RoBERTa input
         N, C, H, W = quant_masked.shape
         quant_seq = quant_masked.permute(0, 2, 3, 1).reshape(N, H*W, C)
@@ -227,16 +250,22 @@ class VQModel_RoBERTa(pl.LightningModule):
 
         if self.args.stage == 2:
             return quant, tk_labels, llm_output
+            
         # Reshape RoBERTa output back to image shape
         quant_pred = llm_output.reshape(N, H, W, C).permute(0, 3, 1, 2)
         # Combine masked and predicted tokens
         quant = quant * (1 - mask.view(N, 1, H, W)) + quant_pred * mask.view(N, 1, H, W)
         dec = self.decode(quant)
+        
         # Loss calculation
         rec_loss = torch.mean(torch.abs(input.contiguous() - dec.contiguous()))
         loss = rec_loss + self.args.rate_q * codebook_loss
+        
+        if self.use_mod and self.training:
+            loss = loss + self.router_aux_loss_coef * aux_loss
 
         return loss, rec_loss, codebook_loss, tk_labels, dec
+
     def encode(self, h):
         quant, indices = self.quantize(h)
         return quant, indices
