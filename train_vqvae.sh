@@ -1,18 +1,16 @@
 #!/bin/bash
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,1,2
 
-torchrun \
-    --nproc_per_node=2 \
-    --master_port=29500 \
-    --nnodes=1 \
-    --node_rank=0 \
+python -m torch.distributed.launch \
+    --nproc_per_node=3 \
+    --master_port=11111 \
     train_vqvae.py \
-    --batch_size=16 \
-    --num_workers=24 \
+    --batch_size=8 \
+    --num_workers=8 \
     --epochs=400 \
-    --distributed \
-    --use_mod True \
-    --capacity_factor=0.75 \
-    --router_aux_loss_coef=0.01 \
-    --output_dir="./output_dir/mod_vqvae_roberta_cifar10" \
-    --log_dir="./output_dir/mod_vqvae_roberta_cifar10" 
+    --dataset="mini-imagenet" \
+    --n_class=1000 \
+    --data_path="/data/drstrange/yaxin/data/mini-imagenet" \
+    --output_dir="./output_dir/vqvae_gpt2_mini_imagenet" \
+    --log_dir="./output_dir/vqvae_gpt2_mini_imagenet" \
+    --resume /data/drstrange/yaxin/Projects/vision_llm/output_dir/vqvae_gpt2_mini_imagenet/vqvae_checkpoint-last.pth

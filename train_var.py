@@ -16,8 +16,8 @@ import torch
 import clip
 from omegaconf import OmegaConf
 import torch.distributed as dist
-from models.models_v2l import VQModel_LLaMA,VQModel_RoBERTa,VQModel_RoBERTa_mae,MultiScale_VQModel_RoBERTa,VQModel_GPT_mae
-from training.engine_training import train_one_epoch
+from models.var_models import VQModel_LLaMA
+from training.engine_training import train_one_epoch_var
 import util.misc as misc
 import socket
 from torchvision import datasets, transforms
@@ -307,9 +307,6 @@ def get_args_parser():
     )
     parser.add_argument("--stage", type=int, default=1, help="Pretraining stage")
     parser.add_argument("--max_seq_len", type=int, default=512, metavar="LENGTH", help="the maximum sequence length")
-    parser.add_argument("--use_mod", type=bool, default=True, help="use MoD for masking")
-    parser.add_argument("--capacity_factor", type=float, default=0.5, help="capacity factor for MoD")
-    parser.add_argument("--router_aux_loss_coef", type=float, default=0.01, help="auxiliary loss coefficient for router")
     # Optimizer parameters
     parser.add_argument("--weight_decay", type=float, default=0.05, help="weight decay (default: 0.05)")
     parser.add_argument("--lr", type=float, default=4.5e-4, metavar="LR", help="learning rate (absolute lr)")
@@ -357,7 +354,7 @@ def get_args_parser():
     parser.add_argument("--quantizer_type", type=str, default="org", help="quantizer type")
     parser.add_argument("--embed_dim", type=int, default=1024, help="embedding dimension")
     parser.add_argument("--rate_q", type=float, default=1, help="codebook loss weight")
-
+    parser.add_argument("--rate_e", type=float, default=0.1, help="entropy loss weight")
     return parser
 
 def main(args):
@@ -469,7 +466,7 @@ def main(args):
 
     config = load_config(args.vq_config_path, display=True)
 
-    model = VQModel_GPT_mae(args=args, **config.model.params)
+    model = VQModel_LLaMA(args=args, **config.model.params)
     if args.distributed:
         model.to(device)  # 使用更新后的device
     else:
@@ -497,7 +494,8 @@ def main(args):
     opt_ae = torch.optim.Adam(list(model_without_ddp.encoder.parameters())+
                             list(model_without_ddp.decoder.parameters())+
                             list(model_without_ddp.quant_conv.parameters())+
-                            list(model_without_ddp.post_quant_conv.parameters()), lr=args.lr, betas=(0.5, 0.9), eps=1e-7)
+                            list(model_without_ddp.post_quant_conv.parameters())+
+                            list(model_without_ddp.next_patch_predictor.parameters()), lr=args.lr, betas=(0.5, 0.9), eps=1e-7)
 
     loss_scaler_ae = NativeScaler()
 
@@ -527,11 +525,11 @@ def main(args):
             data_loader_train.sampler.set_epoch(epoch)
             data_loader_val.sampler.set_epoch(epoch)
 
-        train_stats = train_one_epoch(
+        train_stats = train_one_epoch_var(
             model, data_loader_train, optimizer, device, epoch, loss_scaler, log_writer=log_writer, args=args
         )
 
-        misc.save_model_last_vqvae(
+        misc.save_model_last_var(
                 args=args,
                 model=model,
                 model_without_ddp=model_without_ddp,
@@ -541,7 +539,7 @@ def main(args):
         )
         
         if args.output_dir and (epoch % 10 == 0 or epoch + 1 == args.epochs):
-            misc.save_model_vqvae(
+            misc.save_model_var(
                 args=args,
                 model=model,
                 model_without_ddp=model_without_ddp,
