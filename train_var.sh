@@ -13,5 +13,5 @@ python -m torch.distributed.launch \
     --n_class=1000 \
     --rate_q=1.0 \
     --data_path="/data/drstrange/yaxin/data/mini-imagenet" \
-    --output_dir="./output_dir/var_pretrained_gpt2-medium_mini_imagenet-learnable-codebook_projection" \
-    --log_dir="./output_dir/var_pretrained_gpt2-medium_mini_imagenet-learnable-codebook_projection" 
+    --output_dir="./output_dir/var_pretrained_gpt2-medium_mini_imagenet-frozen-llm" \
+    --log_dir="./output_dir/var_pretrained_gpt2-medium_mini_imagenet-frozen-llm" 

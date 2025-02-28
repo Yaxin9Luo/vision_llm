@@ -66,10 +66,8 @@ class VQModel_LLaMA(pl.LightningModule):
         self.llm_config = GPT2Config.from_pretrained('gpt2-medium')
         self.llm = GPT2Model.from_pretrained('gpt2-medium', config=self.llm_config)
         
-        # Unfreeze the last few layers for fine-tuning
-        for i in range(len(self.llm.h) - 3, len(self.llm.h)):
-            for param in self.llm.h[i].parameters():
-                param.requires_grad = True
+        for param in self.llm.parameters():
+            param.requires_grad = False
                 
         # Use llm's embedding as codebook
         self.register_buffer('codebook', self.llm.wte.weight.detach())
@@ -105,12 +103,15 @@ class VQModel_LLaMA(pl.LightningModule):
         z_q = z + (z_q - z).detach()
         # reshape back to match original input shape
         z_q = rearrange(z_q, 'b h w c -> b c h w').contiguous()
-
+        # 计算unique tokens的数量
+        total_tokens = min_encoding_indices.shape[0]
+        unique_tokens = torch.unique(min_encoding_indices).shape[0]
+        unique_ratio = unique_tokens / self.codebook.shape[0]  # 使用的unique tokens占总codebook的比例
         if self.sane_index_shape:
             min_encoding_indices = min_encoding_indices.reshape(
                 z_q.shape[0], z_q.shape[2], z_q.shape[3])
 
-        return z_q, min_encoding_indices, codebook_loss
+        return z_q, min_encoding_indices, codebook_loss, unique_tokens, unique_ratio
         
     def prepare_embeddings_for_ar(self, quant):
         """
@@ -132,7 +133,7 @@ class VQModel_LLaMA(pl.LightningModule):
     def forward(self, input, data_iter_step=0, step=0, is_val=False, k=21):
         # Encode input image
         encoder_feature = self.quant_conv(self.encoder(input))
-        quant, tk_labels, codebook_loss = self.quantize(encoder_feature)
+        quant, tk_labels, codebook_loss, unique_tokens, unique_ratio = self.quantize(encoder_feature)
         
         # Prepare autoregressive sequence
         input_seq, target_seq = self.prepare_embeddings_for_ar(quant)
@@ -148,7 +149,7 @@ class VQModel_LLaMA(pl.LightningModule):
         pred_embeddings = self.next_patch_predictor(llm_output)
         
         if self.args.stage == 2:
-            return quant, tk_labels, pred_embeddings
+            return quant, tk_labels, pred_embeddings, unique_tokens, unique_ratio
             
         # Calculate autoregressive loss (MSE loss)
         ar_loss = F.mse_loss(pred_embeddings, target_seq)
@@ -196,12 +197,12 @@ class VQModel_LLaMA(pl.LightningModule):
         # Total loss
         loss = rec_loss + self.args.rate_q * codebook_loss + ar_loss
         
-        return loss, rec_loss, codebook_loss,ar_loss, tk_labels, dec
+        return loss, rec_loss, codebook_loss,ar_loss, tk_labels, dec, unique_tokens, unique_ratio
         
     def encode(self, h):
         encoder_feature = self.quant_conv(self.encoder(h))
-        quant, indices, _ = self.quantize(encoder_feature)
-        return quant, indices
+        quant, indices, _, unique_tokens, unique_ratio = self.quantize(encoder_feature)
+        return quant, indices, unique_tokens, unique_ratio
         
     def decode(self, quant):
         quant = self.post_quant_conv(quant)

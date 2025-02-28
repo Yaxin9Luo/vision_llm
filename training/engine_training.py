@@ -154,7 +154,7 @@ def train_one_epoch_var(
         label_cls = label_cls.to(device)
 
         # Use the modified forward function
-        loss, rec_loss, codebook_loss, ar_loss, tk_labels, dec = model(x, cur_iter, step=0)
+        loss, rec_loss, codebook_loss, ar_loss, tk_labels, dec, unique_tokens, unique_ratio = model(x, cur_iter, step=0)
         # # Add global step counter update
         # if hasattr(model, 'module'):  # distributed training
         #     model.module.update_step_counter()
@@ -204,7 +204,16 @@ def train_one_epoch_var(
         metric_logger.update(ar_loss=ar_loss_value)
         misc.all_reduce_mean(ar_loss_value)
         ar_loss_value_reduce = misc.all_reduce_mean(ar_loss_value)
-
+         # 记录unique tokens的信息
+        unique_tokens_value = float(unique_tokens)  # 将整数转换为浮点数
+        metric_logger.update(unique_tokens=unique_tokens_value)
+        misc.all_reduce_mean(unique_tokens_value)
+        unique_tokens_value_reduce = misc.all_reduce_mean(unique_tokens_value)
+        
+        unique_ratio_value = unique_ratio
+        metric_logger.update(unique_ratio=unique_ratio_value)
+        misc.all_reduce_mean(unique_ratio_value)
+        unique_ratio_value_reduce = misc.all_reduce_mean(unique_ratio_value)
 
         # Evaluate autoregressive generation every 1000 iterations (if enabled)
         if data_iter_step % 1000 == 0 and hasattr(args, 'eval_ar_gen') and args.eval_ar_gen:
@@ -252,6 +261,8 @@ def train_one_epoch_var(
             log_writer.add_scalar("Iter/Codebook Loss", codebook_loss_value_reduce, epoch_1000x)
             log_writer.add_scalar("Iter/REC Loss", rec_loss_value_reduce, epoch_1000x)
             log_writer.add_scalar("Iter/AR Loss", ar_loss_value_reduce, epoch_1000x)
+            log_writer.add_scalar("Iter/Unique Tokens", unique_tokens_value_reduce, epoch_1000x)
+            log_writer.add_scalar("Iter/Unique Ratio", unique_ratio_value_reduce, epoch_1000x)
             # If there's autoregressive loss, record it too
             if hasattr(metric_logger.meters, 'ar_rec_loss'):
                 log_writer.add_scalar("Iter/AR REC Loss", metric_logger.meters['ar_rec_loss'].global_avg, epoch_1000x)
@@ -263,6 +274,8 @@ def train_one_epoch_var(
         log_writer.add_scalar("Epoch/Codebook Loss", codebook_loss_value_reduce, epoch)
         log_writer.add_scalar("Epoch/REC Loss", rec_loss_value_reduce, epoch)
         log_writer.add_scalar("Epoch/AR Loss", ar_loss_value_reduce, epoch)
+        log_writer.add_scalar("Epoch/Unique Tokens", unique_tokens_value_reduce, epoch)
+        log_writer.add_scalar("Epoch/Unique Ratio", unique_ratio_value_reduce, epoch)
         # If there's autoregressive loss, record it too
         if 'ar_rec_loss' in metric_logger.meters:
             log_writer.add_scalar("Epoch/AR REC Loss", metric_logger.meters['ar_rec_loss'].global_avg, epoch)

@@ -482,6 +482,7 @@ def main(args):
     
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
+
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, 
                                                          device_ids=[args.gpu],
