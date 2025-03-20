@@ -5,13 +5,14 @@ python -m torch.distributed.launch \
     --nproc_per_node=3 \
     --master_port=29500 \
     train_var.py \
-    --batch_size=8 \
+    --batch_size=16 \
     --num_workers=8 \
     --epochs=400 \
     --distributed \
-    --dataset="mini-imagenet" \
+    --dataset="imagenet" \
     --n_class=1000 \
-    --rate_q=1.0 \
-    --data_path="/data/drstrange/yaxin/data/mini-imagenet" \
-    --output_dir="./output_dir/var_pretrained_gpt2-medium_mini_imagenet-frozen-llm" \
-    --log_dir="./output_dir/var_pretrained_gpt2-medium_mini_imagenet-frozen-llm" 
+    --embed_dim=1024 \
+    --data_path="/data/drstrange/yaxin/data/imagenet" \
+    --output_dir="./output_dir/pretrain_vision_gpt2-medium_imagenet_1024-stage2" \
+    --log_dir="./output_dir/pretrain_vision_gpt2-medium_imagenet_1024-stage2" \
+    --resume /data/drstrange/yaxin/Projects/vision_llm/output_dir/vqvae_gpt2_codebook_imagenet-stage1/vqvae_checkpoint-20.pth

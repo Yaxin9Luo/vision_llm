@@ -16,7 +16,7 @@ import torch
 import clip
 from omegaconf import OmegaConf
 import torch.distributed as dist
-from models.models_v2l import VQModel_LLaMA,VQModel_RoBERTa,VQModel_RoBERTa_mae,MultiScale_VQModel_RoBERTa,VQModel_GPT_mae
+from models.models_v2l import *
 from training.engine_training import train_one_epoch
 import util.misc as misc
 import socket
@@ -177,7 +177,7 @@ class CIFAR10Dataset(Dataset):
             # 返回一个替代样本
             return self.__getitem__((index + 1) % len(self))
 class ImageNetDataset(Dataset):
-    def __init__(self, data_root, image_size, max_words=30, n_class=1000, partition="train", device="cpu", use_subset=0.05):
+    def __init__(self, data_root, image_size, max_words=30, n_class=1000, partition="train", device="cpu", use_subset=1.0):
         self.max_words = max_words
         self.device = device
         self.image_size = image_size
@@ -469,7 +469,7 @@ def main(args):
 
     config = load_config(args.vq_config_path, display=True)
 
-    model = VQModel_GPT_mae(args=args, **config.model.params)
+    model = VQVAE_LLM_Codebook(args=args, **config.model.params)
     if args.distributed:
         model.to(device)  # 使用更新后的device
     else:
@@ -497,7 +497,8 @@ def main(args):
     opt_ae = torch.optim.Adam(list(model_without_ddp.encoder.parameters())+
                             list(model_without_ddp.decoder.parameters())+
                             list(model_without_ddp.quant_conv.parameters())+
-                            list(model_without_ddp.post_quant_conv.parameters()), lr=args.lr, betas=(0.5, 0.9), eps=1e-7)
+                            list(model_without_ddp.post_quant_conv.parameters())+
+                            list(model_without_ddp.adaptor.parameters()), lr=args.lr, betas=(0.5, 0.9), eps=1e-7)
 
     loss_scaler_ae = NativeScaler()
 

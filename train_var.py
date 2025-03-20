@@ -16,7 +16,7 @@ import torch
 import clip
 from omegaconf import OmegaConf
 import torch.distributed as dist
-from models.var_models import VQModel_LLaMA
+from models.var_models import *
 from training.engine_training import train_one_epoch_var
 import util.misc as misc
 import socket
@@ -177,7 +177,7 @@ class CIFAR10Dataset(Dataset):
             # 返回一个替代样本
             return self.__getitem__((index + 1) % len(self))
 class ImageNetDataset(Dataset):
-    def __init__(self, data_root, image_size, max_words=30, n_class=1000, partition="train", device="cpu", use_subset=0.05):
+    def __init__(self, data_root, image_size, max_words=30, n_class=1000, partition="train", device="cpu", use_subset=1.0):
         self.max_words = max_words
         self.device = device
         self.image_size = image_size
@@ -307,6 +307,7 @@ def get_args_parser():
     )
     parser.add_argument("--stage", type=int, default=1, help="Pretraining stage")
     parser.add_argument("--max_seq_len", type=int, default=512, metavar="LENGTH", help="the maximum sequence length")
+
     # Optimizer parameters
     parser.add_argument("--weight_decay", type=float, default=0.05, help="weight decay (default: 0.05)")
     parser.add_argument("--lr", type=float, default=4.5e-4, metavar="LR", help="learning rate (absolute lr)")
@@ -347,14 +348,12 @@ def get_args_parser():
     parser.add_argument("--dist_url", default="env://", help="url used to set up distributed training")
     parser.add_argument("--dist_backend", default="nccl", type=str, help="distributed backend")
     parser.add_argument("--data_path", default="/root/autodl-tmp/data/imagenet", type=str, help="imagenet_path")
-    parser.add_argument("--n_vision_words", default=8192, type=int)
     parser.add_argument("--n_class", default=10, type=int)    # CIFAR10有10个类别
     parser.add_argument("--vq_config_path", type=str, default="vqgan_configs/v2l.yaml", help="VQVAE config path")
     parser.add_argument("--image_size", type=int, default=256, help="input image size")
     parser.add_argument("--quantizer_type", type=str, default="org", help="quantizer type")
     parser.add_argument("--embed_dim", type=int, default=1024, help="embedding dimension")
-    parser.add_argument("--rate_q", type=float, default=1, help="codebook loss weight")
-    parser.add_argument("--rate_e", type=float, default=0.1, help="entropy loss weight")
+
     return parser
 
 def main(args):
@@ -466,7 +465,7 @@ def main(args):
 
     config = load_config(args.vq_config_path, display=True)
 
-    model = VQModel_LLaMA(args=args, **config.model.params)
+    model = Vision_LLM(args=args,ckpt_path=args.resume, **config.model.params)
     if args.distributed:
         model.to(device)  # 使用更新后的device
     else:
@@ -482,7 +481,6 @@ def main(args):
     
     print(f"Total parameters: {total_params:,}")
     print(f"Trainable parameters: {trainable_params:,}")
-
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, 
                                                          device_ids=[args.gpu],
@@ -492,11 +490,7 @@ def main(args):
     else:
         model_without_ddp = model
 
-    opt_ae = torch.optim.Adam(list(model_without_ddp.encoder.parameters())+
-                            list(model_without_ddp.decoder.parameters())+
-                            list(model_without_ddp.quant_conv.parameters())+
-                            list(model_without_ddp.post_quant_conv.parameters())+
-                            list(model_without_ddp.next_patch_predictor.parameters()), lr=args.lr, betas=(0.5, 0.9), eps=1e-7)
+    opt_ae = torch.optim.Adam(list(model_without_ddp.llm.parameters()), lr=args.lr, betas=(0.5, 0.9), eps=1e-7)
 
     loss_scaler_ae = NativeScaler()
 
@@ -530,7 +524,7 @@ def main(args):
             model, data_loader_train, optimizer, device, epoch, loss_scaler, log_writer=log_writer, args=args
         )
 
-        misc.save_model_last_var(
+        misc.save_model_var(
                 args=args,
                 model=model,
                 model_without_ddp=model_without_ddp,
@@ -540,7 +534,7 @@ def main(args):
         )
         
         if args.output_dir and (epoch % 10 == 0 or epoch + 1 == args.epochs):
-            misc.save_model_var(
+            misc.save_model_last_var(
                 args=args,
                 model=model,
                 model_without_ddp=model_without_ddp,

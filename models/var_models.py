@@ -6,11 +6,12 @@ from einops import rearrange
 from torch.nn import Embedding
 from models.encoder_decoder import Encoder, Decoder
 from transformers import GPT2Model, GPT2Config, GPT2LMHeadModel
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig,AutoModel
 from transformers import RobertaModel, RobertaConfig
 import torch.nn as nn
 import numpy as np
 import torchvision
+import os
 
 def get_obj_from_str(string, reload=False):
     module, cls = string.rsplit(".", 1)
@@ -25,7 +26,7 @@ def instantiate_from_config(config):
     return get_obj_from_str(config["target"])(**config.get("params", dict()))
 
 
-class VQModel_LLaMA(pl.LightningModule):
+class Vision_LLM(pl.LightningModule):
     def __init__(self,
                  args,
                  ddconfig,
@@ -36,7 +37,7 @@ class VQModel_LLaMA(pl.LightningModule):
                  colorize_nlabels=None,
                  monitor=None,
                  remap=None,
-                 sane_index_shape=False,  # tell vector quantizer to return indices as bhw
+                 sane_index_shape=False,
                  ):
         super().__init__()
         self.image_key = image_key
@@ -46,169 +47,231 @@ class VQModel_LLaMA(pl.LightningModule):
         self.e_dim = embed_dim
         self.remap = remap
         self.sane_index_shape = sane_index_shape
-        
-        # Set default parameters
-        if not hasattr(self.args, 'use_ar_recon'):
-            self.args.use_ar_recon = False
-        if not hasattr(self.args, 'train_ar_recon'):
-            self.args.train_ar_recon = False
-        if not hasattr(self.args, 'eval_ar_gen'):
-            self.args.eval_ar_gen = False
-            
+
         ### Encoder & Decoder
         self.stage = args.stage
         self.encoder = Encoder(**ddconfig)
         self.decoder = Decoder(**ddconfig)
-        self.quant_conv = torch.nn.Conv2d(ddconfig["z_channels"], embed_dim, 1)
-        self.post_quant_conv = torch.nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
+        self.quant_conv = nn.Conv2d(ddconfig["z_channels"], embed_dim, 1)
+        self.post_quant_conv = nn.Conv2d(embed_dim, ddconfig["z_channels"], 1)
         
-        # Use GPT2Model
+        # LLM Configuration
         self.llm_config = GPT2Config.from_pretrained('gpt2-medium')
-        self.llm = GPT2Model.from_pretrained('gpt2-medium', config=self.llm_config)
+        # 从头初始化LLM，而不是加载预训练权重
+        self.llm = GPT2LMHeadModel(config=self.llm_config)
+        self.llm.init_weights()
+        # 只加载预训练模型的词嵌入作为codebook
+        pretrained_model = GPT2LMHeadModel.from_pretrained('gpt2-medium')
+        pretrained_embeddings = pretrained_model.transformer.wte.weight.detach()
+        del pretrained_model  # 释放预训练模型内存
+        del self.decoder
+        del self.post_quant_conv
+        # 注册词嵌入作为codebook
+        self.register_buffer('codebook', pretrained_embeddings)
+        codebook_embed_dim = self.codebook.shape[1]
+        # self.proj_to_256 = nn.Linear(codebook_embed_dim, self.e_dim, bias=False)
+        #
+        self.codebook_size = self.codebook.shape[0]
         
-        for param in self.llm.parameters():
-            param.requires_grad = False
-                
-        # Use llm's embedding as codebook
-        self.register_buffer('codebook', self.llm.wte.weight.detach())
-        
-        # Add position encoding for autoregressive prediction
-        self.register_buffer('position_ids', torch.arange(0, 1024).expand((1, -1)))
-        
-        # Add projection layer for predicting the next patch embedding
-        self.next_patch_predictor = nn.Linear(self.llm_config.hidden_size, self.e_dim)
-        
-        # Add embedding for the start token
-        self.register_buffer('bos_embedding', torch.zeros(1, 1, self.e_dim))
-        
-        # Add temperature parameter for sampling
-        self.temperature = 1.0
-        
+        # ------------------------------------------------------------------
+        # 1) MLP adaptor instead of single linear layer
+        #    e_dim ->  hidden size -> codebook_size
+        # ------------------------------------------------------------------
+        hidden_dim = int(self.e_dim // 2)
+        self.adaptor = nn.Sequential(
+            nn.Linear(self.e_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, self.e_dim),
+            nn.LayerNorm(self.e_dim),
+            nn.SiLU(),
+            nn.Linear(self.e_dim, self.codebook_size),
+        )
+        # ------------------------------------------------------------------
+        # 2) Gumbel temperature annealing parameters
+        # ------------------------------------------------------------------
+        self.tau_start = 1.0          # initial temperature
+        self.tau_min = 0.1            # minimum temperature
+        self.tau_decay_rate = 1 # exponential decay base
+        self.gumbel_temp = self.tau_start  # current temperature
 
-    def quantize(self, z):
-        # reshape z -> (batch, height, width, channel) and flatten
-        z = rearrange(z, 'b c h w -> b h w c').contiguous()
-        z_flattened = z.view(-1, self.e_dim)
+        self.code_usage_counts = torch.zeros(self.codebook_size, dtype=torch.long)
+        
+        # 加载预训练模型（第一阶段）
+        if ckpt_path is not None and os.path.exists(ckpt_path):
+            self._load_pretrained_model(ckpt_path, ignore_keys)
+            print(f"success to load the pretrained model: {ckpt_path}")
+        
+        # 冻结除LLM以外的所有参数
+        self._freeze_non_llm_params()
 
-        # Find nearest neighbors in the llm codebook
-        d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
-           torch.sum(self.codebook.detach()**2, dim=1) - 2 * \
-           torch.einsum('bd,dn->bn', z_flattened, rearrange(self.codebook.detach(), 'n d -> d n'))
-
-        min_encoding_indices = torch.argmin(d, dim=1)
-        z_q = F.embedding(min_encoding_indices, self.codebook).view(z.shape)
-        codebook_loss = torch.mean((z_q.detach()-z)**2) + 0.33 * \
-                torch.mean((z_q - z.detach()) ** 2)
-        # Straight-through estimator
-        z_q = z + (z_q - z).detach()
-        # reshape back to match original input shape
-        z_q = rearrange(z_q, 'b h w c -> b c h w').contiguous()
-        # 计算unique tokens的数量
-        total_tokens = min_encoding_indices.shape[0]
-        unique_tokens = torch.unique(min_encoding_indices).shape[0]
-        unique_ratio = unique_tokens / self.codebook.shape[0]  # 使用的unique tokens占总codebook的比例
-        if self.sane_index_shape:
-            min_encoding_indices = min_encoding_indices.reshape(
-                z_q.shape[0], z_q.shape[2], z_q.shape[3])
-
-        return z_q, min_encoding_indices, codebook_loss, unique_tokens, unique_ratio
-        
-    def prepare_embeddings_for_ar(self, quant):
-        """
-        Prepare quantized patch embeddings for autoregressive sequence
-        """
-        # Convert quant from [B, C, H, W] to sequence [B, H*W, C]
-        N, C, H, W = quant.shape
-        quant_seq = quant.permute(0, 2, 3, 1).reshape(N, H*W, C)
-        
-        # Create input sequence and target sequence
-        # Input sequence: [BOS, e1, e2, ..., en-1]
-        # Target sequence: [e1, e2, ..., en]
-        bos_tokens = self.bos_embedding.expand(N, -1, -1)
-        input_seq = torch.cat([bos_tokens, quant_seq[:, :-1]], dim=1)
-        target_seq = quant_seq
-        
-        return input_seq, target_seq
-    
-    def forward(self, input, data_iter_step=0, step=0, is_val=False, k=21):
-        # Encode input image
-        encoder_feature = self.quant_conv(self.encoder(input))
-        quant, tk_labels, codebook_loss, unique_tokens, unique_ratio = self.quantize(encoder_feature)
-        
-        # Prepare autoregressive sequence
-        input_seq, target_seq = self.prepare_embeddings_for_ar(quant)
-        
-        # Get position IDs
-        seq_len = input_seq.shape[1]
-        position_ids = self.position_ids[:, :seq_len]
-        
-        # Autoregressive prediction through GPT2
-        llm_output = self.llm(inputs_embeds=input_seq, position_ids=position_ids).last_hidden_state
-        
-        # Predict next patch embedding
-        pred_embeddings = self.next_patch_predictor(llm_output)
-        
-        if self.args.stage == 2:
-            return quant, tk_labels, pred_embeddings, unique_tokens, unique_ratio
+    def _load_pretrained_model(self, ckpt_path, ignore_keys=[]):
+        """加载预训练模型权重"""
+        if os.path.isdir(ckpt_path):
+            # 如果提供的是目录，查找最新的检查点文件
+            checkpoint_files = [f for f in os.listdir(ckpt_path) if f.startswith('vqvae_checkpoint-') and f.endswith('.pth')]
+            if not checkpoint_files:
+                print(f"warning: no checkpoint file found in {ckpt_path}")
+                return
             
-        # Calculate autoregressive loss (MSE loss)
-        ar_loss = F.mse_loss(pred_embeddings, target_seq)
-        
-        # Reconstruct image from predicted embeddings
-        N, L, C = pred_embeddings.shape
-        H = W = int(np.sqrt(L))
-        
-        # Build complete image representation
-        # By default, use original quant as base, only use predicted embeddings to evaluate autoregressive loss
-        recon_embeddings = quant
-        
-        # If autoregressive reconstruction is enabled (during validation or training)
-        if (is_val and self.args.use_ar_recon) or (not is_val and self.args.train_ar_recon):
-            # Use autoregressive method to generate complete image representation
-            # During training, we need to keep gradients; during validation, no gradients needed
-            with torch.set_grad_enabled(not is_val):
-                # Start generation from BOS
-                generated = self.bos_embedding.expand(N, 1, -1).to(input.device)
-                
-                # Autoregressive generation
-                for i in range(H*W):
-                    # Get position IDs
-                    pos_ids = self.position_ids[:, :generated.shape[1]]
+            # 如果有last检查点，优先使用
+            if 'vqvae_checkpoint-last.pth' in checkpoint_files:
+                checkpoint_path = os.path.join(ckpt_path, 'vqvae_checkpoint-last.pth')
+            else:
+                # 否则使用编号最大的检查点
+                checkpoint_files = [f for f in checkpoint_files if 'last' not in f]
+                if not checkpoint_files:
+                    print(f"warning: no valid checkpoint file found in {ckpt_path}")
+                    return
                     
-                    # Predict next embedding through GPT2
-                    output = self.llm(inputs_embeds=generated, position_ids=pos_ids).last_hidden_state
-                    next_emb = self.next_patch_predictor(output[:, -1:])
-                    
-                    # Add to generated sequence
-                    generated = torch.cat([generated, next_emb], dim=1)
-                
-                # Remove BOS embedding
-                generated = generated[:, 1:]
-                
-                # Reshape to image shape
-                recon_embeddings = generated.reshape(N, H, W, C).permute(0, 3, 1, 2).contiguous()
+                # 按编号排序，获取最新的检查点
+                checkpoint_files.sort(key=lambda x: int(x.split('-')[1].split('.')[0]))
+                checkpoint_path = os.path.join(ckpt_path, checkpoint_files[-1])
+        else:
+            checkpoint_path = ckpt_path
         
-        # Decode reconstructed image
-        dec = self.decode(recon_embeddings)
+        print(f"load the checkpoint file: {checkpoint_path}")
+        try:
+            # 添加weights_only=False来解决PyTorch 2.6的兼容性问题
+            state_dict = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+            print("success to load the checkpoint file using weights_only=False")
+        except Exception as e:
+            print(f"error to load the checkpoint file: {e}")
+            try:
+                # 尝试直接添加安全全局对象
+                import argparse
+                import torch.serialization
+                torch.serialization.add_safe_globals([argparse.Namespace])
+                state_dict = torch.load(checkpoint_path, map_location='cpu')
+                print("success to load the checkpoint file using add_safe_globals")
+            except Exception as e2:
+                print(f"try other methods to load the checkpoint file failed: {e2}")
+                print("please check the checkpoint file.")
+                return
         
-        # Calculate reconstruction loss
-        rec_loss = torch.mean(torch.abs(input.contiguous() - dec.contiguous()))
+        # 获取模型状态字典
+        if isinstance(state_dict, dict) and 'state_dict' in state_dict:
+            state_dict = state_dict['state_dict']
+        elif isinstance(state_dict, dict) and 'model' in state_dict:
+            state_dict = state_dict['model']
+            
+        # 过滤不需要的键
+        for k in list(state_dict.keys()):
+            for ik in ignore_keys:
+                if k.startswith(ik):
+                    print(f"delete the key: {k}")
+                    del state_dict[k]
+            
+            # 跳过LLM相关的参数
+            if k.startswith('llm.'):
+                print(f"keep the LLM parameters for the second stage training: {k}")
+                del state_dict[k]
         
-        # Total loss
-        loss = rec_loss + self.args.rate_q * codebook_loss + ar_loss
+        # 加载状态字典
+        missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)
         
-        return loss, rec_loss, codebook_loss,ar_loss, tk_labels, dec, unique_tokens, unique_ratio
+        print(f"success to load the pretrained model. missing keys: {missing_keys}, unexpected keys: {unexpected_keys}")
+
+
+    def quantize(self, z, tau=None):
+        """
+        Uses a Gumbel-Softmax approach to pick discrete indices for each latent vector.
+        """
+        if tau is None:
+            tau = self.gumbel_temp
+
+        # [B, C, H, W] -> [B, H, W, C]
+        z = rearrange(z, 'b c h w -> b h w c').contiguous()
+        b, h, w, c = z.shape
+        z_flat = z.view(b * h * w, c)
+
+        # Adaptor predicts logits -> [B*H*W, vocab_size]
+        logits = self.adaptor(z_flat)
+
+        # Gumbel-Softmax to get discrete one-hot
+        one_hot = F.gumbel_softmax(logits, tau=tau, hard=True)
+        # codebook_256 = self.proj_to_256(self.codebook)   # shape: [V, 256]
         
+        # Quantized vectors via codebook
+        # z_q_flat = one_hot @ codebook_256  # [B*H*W, e_dim]
+        z_q_flat = one_hot @ self.codebook
+        z_q = z_q_flat.view(b, h, w, c)
+        
+        # VQ-style loss
+        codebook_loss = torch.mean((z_q.detach() - z)**2) + 0.33 * torch.mean((z_q - z.detach())**2)
+
+        # Straight-through trick
+        z_q = z + (z_q - z).detach()
+        
+        # Reshape back
+        z_q = rearrange(z_q, 'b h w c -> b c h w').contiguous()
+
+        # Discrete indices = argmax of one_hot
+        min_encoding_indices = torch.argmax(one_hot, dim=-1)  # [B*H*W]
+        min_encoding_indices = min_encoding_indices.view(b, h*w)
+        
+        return z_q, min_encoding_indices, codebook_loss
+
+    def forward(self, input, data_iter_step, step=0, is_val=False, k=21):
+        b = input.shape[0]
+
+        if not is_val:
+            # Exponential decay: tau = max(tau_min, tau_start * (decay_rate ** step))
+            # Here we use data_iter_step, but you can use 'step' or an internal self.current_step.
+            self.gumbel_temp = max(
+                self.tau_min,
+                self.tau_start * (self.tau_decay_rate ** data_iter_step)
+            )
+            # or a linear-ish schedule across steps
+            # self.gumbel_temp = max(
+            #     self.tau_min,
+            #     self.gumbel_temp * (1.0 - self.tau_decay)
+            # )
+        encoder_feature = self.quant_conv(self.encoder(input))
+        
+        quant, tk_labels, codebook_loss = self.quantize(encoder_feature, tau=self.gumbel_temp)
+
+        # 第二阶段：自回归LLM训练
+        # 准备自回归训练的输入和目标
+        # 获取LLM的输出
+        outputs = self.llm(input_ids=tk_labels,labels=tk_labels,output_hidden_states=True)
+        loss = outputs.loss
+        
+        return loss, tk_labels
+
+    @torch.no_grad()
+    def update_code_usage(self, indices):
+        """
+        Accumulate usage counts across the training run.
+        indices: discrete code indices from the batch, shape [B*H*W] or [B, H, W].
+        """
+        # Flatten to 1D
+        flat_indices = indices.view(-1)
+        
+        # Move indices to CPU
+        flat_indices = flat_indices.detach().cpu()
+        
+        # Index-add approach to increment usage counts
+        # We add 1 for each occurrence of each index in flat_indices
+        ones = torch.ones_like(flat_indices, dtype=torch.long)
+        self.code_usage_counts.index_add_(0, flat_indices, ones)
+
+    def on_train_epoch_end(self):
+        """
+        At the end of each epoch, log how many codes have been used so far.
+        """
+        used_codes = (self.code_usage_counts > 0).sum()
+        self.log("unique_tokens_total", used_codes.item(), prog_bar=True, on_epoch=True)
+
     def encode(self, h):
-        encoder_feature = self.quant_conv(self.encoder(h))
-        quant, indices, _, unique_tokens, unique_ratio = self.quantize(encoder_feature)
-        return quant, indices, unique_tokens, unique_ratio
-        
+        quant, indices, _ = self.quantize(h)
+        return quant, indices
+
     def decode(self, quant):
         quant = self.post_quant_conv(quant)
         dec = self.decoder(quant)
         return dec
-        
+
     def get_last_layer(self):
         return self.decoder.conv_out.weight
 
@@ -219,120 +282,26 @@ class VQModel_LLaMA(pl.LightningModule):
         x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format).float()
         return x
 
-    def training_step(self, batch, batch_idx, optimizer_idx):
-        x = self.get_input(batch, self.image_key)
-        loss, rec_loss, codebook_loss, _, _ = self(x)
-        self.log("train/loss", loss, prog_bar=True)
-        self.log("train/rec_loss", rec_loss, prog_bar=True)
-        self.log("train/codebook_loss", codebook_loss, prog_bar=True)
-        return loss
+    def _freeze_non_llm_params(self):
+        """冻结除LLM以外的所有参数"""
+        # 冻结编码器
+        for param in self.encoder.parameters():
+            param.requires_grad = False
 
-    def validation_step(self, batch, batch_idx):
-        x = self.get_input(batch, self.image_key)
-        loss, rec_loss, codebook_loss, _, dec = self(x, is_val=True)
+        # for param in self.decoder.parameters():
+        #     param.requires_grad = False
         
-        # Record standard losses
-        self.log("val/loss", loss, prog_bar=True)
-        self.log("val/rec_loss", rec_loss, prog_bar=True)
-        self.log("val/codebook_loss", codebook_loss, prog_bar=True)
-        
-        # If needed, evaluate autoregressive generation quality
-        if batch_idx == 0 and hasattr(self.args, 'eval_ar_gen') and self.args.eval_ar_gen:
-            # Generate images using autoregressive method
-            ar_gen_img, _ = self.generate(input_image=x, temperature=0.0)  # No temperature, deterministic generation
-            
-            # Calculate reconstruction loss with original images
-            ar_rec_loss = torch.mean(torch.abs(x.contiguous() - ar_gen_img.contiguous()))
-            self.log("val/ar_rec_loss", ar_rec_loss, prog_bar=True)
-            
-            # If possible, save generated images for visualization
-            if hasattr(self.logger, 'experiment') and hasattr(self.logger.experiment, 'add_image'):
-                # Convert images to range [0, 1]
-                x_vis = (x + 1) / 2
-                dec_vis = (dec + 1) / 2
-                ar_gen_vis = (ar_gen_img + 1) / 2
-                
-                # Concatenate original images, standard reconstructions and autoregressive generations
-                grid = torch.cat([x_vis[:4], dec_vis[:4], ar_gen_vis[:4]], dim=0)
-                grid_img = torchvision.utils.make_grid(grid, nrow=4)
-                
-                # Add to tensorboard
-                self.logger.experiment.add_image(
-                    f'val/comparison_ep{self.current_epoch}', 
-                    grid_img, 
-                    global_step=self.global_step
-                )
-        
-        return loss
+        # 冻结量化相关层
+        for param in self.quant_conv.parameters():
+            param.requires_grad = False
 
-    def configure_optimizers(self):
-        opt = torch.optim.Adam(list(self.encoder.parameters()) +
-                             list(self.decoder.parameters()) +
-                             list(self.quant_conv.parameters()) +
-                             list(self.post_quant_conv.parameters()) +
-                             list(self.next_patch_predictor.parameters()) +
-                             [p for i in range(len(self.llm.h) - 3, len(self.llm.h)) 
-                              for p in self.llm.h[i].parameters() if p.requires_grad],
-                             lr=self.args.learning_rate)
-        return opt
+        # for param in self.post_quant_conv.parameters():
+        #     param.requires_grad = False
+
+        # # 冻结适配器
+        for param in self.adaptor.parameters():
+            param.requires_grad = False
         
-    @torch.no_grad()
-    def generate(self, input_image=None, start_embeddings=None, num_steps=None, temperature=1.0):
-        """
-        Autoregressive image generation
-        """
-        # If input image is provided, encode it
-        if input_image is not None:
-            quant, _ = self.encode(input_image)
-            N, C, H, W = quant.shape
-            seq_len = H * W
-        # Otherwise use provided start embeddings
-        elif start_embeddings is not None:
-            N, L, C = start_embeddings.shape
-            seq_len = L
-            H = W = int(np.sqrt(seq_len))
-        else:
-            raise ValueError("Must provide either input_image or start_embeddings")
-            
-        # If number of steps not specified, use sequence length
-        if num_steps is None:
-            num_steps = seq_len
-            
-        # Create starting sequence (only BOS embedding)
-        generated = self.bos_embedding.expand(N, 1, -1).to(input_image.device if input_image is not None else start_embeddings.device)
-        
-        # If start embeddings provided, add them to generated sequence
-        if start_embeddings is not None:
-            generated = torch.cat([generated, start_embeddings], dim=1)
-        
-        # Autoregressive generation
-        for _ in range(num_steps):
-            # Get position IDs
-            position_ids = self.position_ids[:, :generated.shape[1]]
-            
-            # Predict next embedding through GPT2
-            llm_output = self.llm(inputs_embeds=generated, position_ids=position_ids).last_hidden_state
-            next_embedding = self.next_patch_predictor(llm_output[:, -1:])
-            
-            # Add noise to increase diversity
-            if temperature > 0:
-                noise = torch.randn_like(next_embedding) * temperature
-                next_embedding = next_embedding + noise
-            
-            # Add to generated sequence
-            generated = torch.cat([generated, next_embedding], dim=1)
-            
-            # Stop if generated sequence is long enough
-            if generated.shape[1] > seq_len + 1:  # +1 is for BOS
-                break
-                
-        # Remove BOS embedding
-        generated = generated[:, 1:]
-        
-        # Reshape to image shape
-        generated_embeddings = generated.reshape(N, H, W, C).permute(0, 3, 1, 2).contiguous()
-        
-        # Decode generated image
-        generated_image = self.decode(generated_embeddings)
-        
-        return generated_image, generated_embeddings
+        # 冻结投影层
+        # for param in self.proj_to_256.parameters():
+        #     param.requires_grad = False
