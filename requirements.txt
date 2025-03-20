@@ -87,8 +87,8 @@ tensorboard-data-server==0.7.2
 threadpoolctl==3.5.0
 tokenizers==0.20.3
 torch==2.6.0
-torchmetrics==1.6.1
-torchvision==0.15.2
+torchmetrics
+torchvision
 tqdm==4.67.1
 transformers==4.45.0
 triton==3.2.0
